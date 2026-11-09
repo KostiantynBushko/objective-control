@@ -16,6 +16,7 @@
 
 #ifdef OC_HAVE_OPENCV
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #include "mjpeg_stream.hpp"
 #endif
@@ -97,7 +98,7 @@ bool isKnownOption(const std::string& name) {
         "mode",    "source", "width",       "height", "fps",
         "frames",  "seconds", "out",       "record", "stream",
         "preview", "window-size", "window-fullscreen", "help",
-        "faces",   "face-model",
+        "faces",   "face-model", "face-score", "face-detect-width",
         "recognize", "enroll", "face-db", "face-recognition-model",
         "face-max-distance",
     };
@@ -191,13 +192,23 @@ Options:
   --window-size=<size>   Preview window size: native (default) or <width>x<height>
   --window-fullscreen    Make the preview window fullscreen
   --faces                Run face detection on each captured frame and
-                         report how many faces were found (requires a build
-                         with OBJECTIVE_CONTROL_ENABLE_FACE=ON)
+                         report how many faces were found. With --preview
+                         or --stream the detected faces are also drawn onto
+                         the image (requires a build with
+                         OBJECTIVE_CONTROL_ENABLE_FACE=ON)
   --face-model=<path>    YuNet model file used by --faces
                          (default: third_party/face-detection/models/
                           face_detection_yunet_2023mar.onnx)
+  --face-score=<f>       Minimum detection confidence to report a face
+                         (default: 0.6; lower catches smaller faces)
+  --face-detect-width=<px>
+                         Width the detector runs at; the frame is scaled
+                         down to it, so detection costs less. 0 means native
+                         resolution (default: 960)
   --recognize            Identify every detected face against the enrolled
-                         set and print the person id (implies --faces)
+                         set and print the person id; with --preview or
+                         --stream the person id is drawn next to the box
+                         (implies --faces)
   --face-db=<path>       Face database file. Loaded when it exists and
                          written back when --enroll is used.
   --enroll=<id>          Enrol the most confident face of the first frame
@@ -238,6 +249,10 @@ Examples:
   # Fullscreen preview of an IP camera
   objective-control-app --mode=ip --source=http://host/?action=stream \
       --preview --window-fullscreen
+
+  # Preview an RTSP camera with the detected faces drawn on the frames
+  objective-control-app --mode=ip --source=rtsp://host:554/stream \
+      --preview --faces --recognize --face-db=faces.db
 
   # Detect faces in ten frames from a USB camera
   objective-control-app --mode=embedded --source=/dev/video0 --frames=10 --faces
@@ -320,6 +335,71 @@ bool writeFrame(cv::VideoWriter& writer, const oc::Frame& frame) {
     writer.write(image);
     return true;
 }
+
+#ifdef OC_HAVE_FACE
+// Copies a cv::Mat into the layout the face library expects. fd::Image owns
+// its pixels, so this is one copy per frame; both use the same dense BGR
+// layout, so no colour conversion is needed.
+fd::Image toFaceImage(const cv::Mat& mat) {
+    const cv::Mat src = mat.isContinuous() ? mat : mat.clone();
+    fd::Image image;
+    image.width = src.cols;
+    image.height = src.rows;
+    image.channels = src.channels();
+    const std::size_t bytes =
+        static_cast<std::size_t>(src.total()) * src.elemSize();
+    image.data.assign(src.ptr(), src.ptr() + bytes);
+    return image;
+}
+
+// Draws a box and a caption for every detected face. A recognised person
+// gets a green box, an unknown face an amber one, so the overlay can be
+// read at a glance.
+void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
+                   const std::vector<std::string>& labels) {
+    // Scale the stroke and the caption with the frame so the overlay stays
+    // readable on both a 320x240 sub-stream and a 4K one.
+    const int thickness = std::max(1, image.cols / 400);
+    const double fontScale =
+        std::max(0.4, static_cast<double>(image.cols) / 1600.0);
+
+    for (std::size_t i = 0; i < faces.size(); ++i) {
+        const fd::FaceBox& face = faces[i];
+        const std::string label =
+            (i < labels.size()) ? labels[i] : std::string();
+        const bool known = label.rfind("person ", 0) == 0;
+
+        const cv::Scalar color =
+            known ? cv::Scalar(0, 220, 0) : cv::Scalar(0, 165, 255);
+        cv::rectangle(image,
+                      cv::Rect(face.x, face.y, face.width, face.height),
+                      color, thickness);
+
+        if (label.empty()) {
+            continue;
+        }
+
+        // Caption above the box; flip it below when there is no room.
+        int baseline = 0;
+        const cv::Size textSize =
+            cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+                            thickness, &baseline);
+        int textY = face.y - 6;
+        if (textY - textSize.height < 0) {
+            textY = face.y + textSize.height + 6;
+        }
+        const int textX = std::max(0, face.x);
+
+        cv::rectangle(image,
+                      cv::Rect(textX, textY - textSize.height - 4,
+                               textSize.width + 8, textSize.height + 6),
+                      color, cv::FILLED);
+        cv::putText(image, label, cv::Point(textX + 4, textY - 4),
+                    cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 0, 0),
+                    thickness, cv::LINE_AA);
+    }
+}
+#endif
 #endif
 
 } // namespace
@@ -355,6 +435,10 @@ int main(int argc, char** argv) {
     const std::string faceModel = arg(argc, argv, "face-model",
                                       "third_party/face-detection/models/"
                                       "face_detection_yunet_2023mar.onnx");
+    const double faceScore =
+        std::atof(arg(argc, argv, "face-score", "0.6").c_str());
+    const int faceDetectWidth =
+        std::atoi(arg(argc, argv, "face-detect-width", "960").c_str());
     const bool doRecognize = flag(argc, argv, "recognize");
     const std::string enrollStr = arg(argc, argv, "enroll", "");
     const std::string faceDbPath = arg(argc, argv, "face-db", "");
@@ -428,6 +512,92 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ---------------- Face detection / recognition (optional submodule) ----------------
+#ifdef OC_HAVE_FACE
+    // --recognize and --enroll both need the detector, so they imply --faces.
+    const bool runFaces = detectFaces || doRecognize || enrollId >= 0;
+
+    std::unique_ptr<fd::FaceDetector> faceDetector;
+    if (runFaces) {
+        faceDetector = std::make_unique<fd::FaceDetector>();
+        fd::FaceDetector::Options faceOptions;
+        faceOptions.model_path = faceModel;
+        faceOptions.score_threshold = static_cast<float>(faceScore);
+        faceOptions.detection_width = faceDetectWidth;
+        if (!faceDetector->open(faceOptions)) {
+            std::cerr << "Could not load the face-detection model '"
+                      << faceModel << "'.\nRun "
+                         "third_party/face-detection/models/fetch.sh to "
+                         "download it.\n";
+            camera->close();
+            return 1;
+        }
+        std::cout << "Face detection enabled (model: " << faceModel << ").\n";
+    }
+
+    std::unique_ptr<fd::FaceRecognizer> faceRecognizer;
+    fd::FaceDatabase faceDatabase;
+    if (doRecognize || enrollId >= 0) {
+        faceRecognizer = std::make_unique<fd::FaceRecognizer>();
+        fd::FaceRecognizer::Options recOptions;
+        recOptions.model_path = faceRecModel;
+        if (!faceRecognizer->open(recOptions)) {
+            std::cerr << "Could not load the face-recognition model '"
+                      << faceRecModel << "'.\nRun "
+                         "third_party/face-detection/models/fetch.sh to "
+                         "download it.\n";
+            camera->close();
+            return 1;
+        }
+        std::cout << "Face recognition enabled (model: " << faceRecModel
+                  << ").\n";
+
+        if (!faceDbPath.empty() && faceDatabase.load(faceDbPath)) {
+            std::cout << "Loaded " << faceDatabase.size() << " enrolment(s) from "
+                      << faceDbPath << ".\n";
+        } else if (doRecognize && !faceDbPath.empty()) {
+            std::cout << "No face database at '" << faceDbPath
+                      << "'; no one can be recognised yet.\n";
+        }
+    }
+#else
+    if (detectFaces || doRecognize || enrollId >= 0) {
+        std::cerr << "--faces/--recognize/--enroll require a build with "
+                     "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
+        camera->close();
+        return 1;
+    }
+#endif
+
+#if defined(OC_HAVE_FACE) && defined(OC_HAVE_OPENCV)
+    // Detects the faces in a frame and draws them, labelling each one with
+    // the person id when the face is known. Returns the number of faces.
+    auto annotateFrame = [&](cv::Mat& image) -> int {
+        const fd::Image faceImage = toFaceImage(image);
+        const std::vector<fd::FaceBox> faces = faceDetector->detect(faceImage);
+
+        std::vector<std::string> labels;
+        labels.reserve(faces.size());
+        for (const fd::FaceBox& face : faces) {
+            std::string label = "unknown";
+            if (faceRecognizer) {
+                fd::Embedding embedding;
+                if (faceRecognizer->embed(faceImage, face, embedding)) {
+                    const fd::FaceDatabase::Match match = faceDatabase.match(
+                        embedding, static_cast<float>(maxDistance));
+                    if (match.matched) {
+                        label = "person " + std::to_string(match.person_id);
+                    }
+                }
+            }
+            labels.push_back(label);
+        }
+
+        annotateFaces(image, faces, labels);
+        return static_cast<int>(faces.size());
+    };
+#endif
+
     // ---------------- Live streaming / preview -------------
     if (streamPort > 0 || preview) {
 #ifdef OC_HAVE_OPENCV
@@ -446,6 +616,14 @@ int main(int argc, char** argv) {
                         // Deep-copy: the grabbed Frame is destroyed when this
                         // lambda returns, so the cv::Mat must own its data.
                         out = view.clone();
+#if defined(OC_HAVE_FACE) && defined(OC_HAVE_OPENCV)
+                        // Draw the same boxes the console path reports, so the
+                        // preview window and the MJPEG stream are annotated
+                        // instead of showing raw frames.
+                        if (faceDetector) {
+                            annotateFrame(out);
+                        }
+#endif
                         std::this_thread::sleep_until(nextFrame);
                         nextFrame = std::chrono::steady_clock::now() + period;
                         return true;
@@ -570,61 +748,6 @@ int main(int argc, char** argv) {
         return 1;
 #endif
     }
-
-    // ---------------- Face detection / recognition (optional submodule) ----------------
-#ifdef OC_HAVE_FACE
-    // --recognize and --enroll both need the detector, so they imply --faces.
-    const bool runFaces = detectFaces || doRecognize || enrollId >= 0;
-
-    std::unique_ptr<fd::FaceDetector> faceDetector;
-    if (runFaces) {
-        faceDetector = std::make_unique<fd::FaceDetector>();
-        fd::FaceDetector::Options faceOptions;
-        faceOptions.model_path = faceModel;
-        if (!faceDetector->open(faceOptions)) {
-            std::cerr << "Could not load the face-detection model '"
-                      << faceModel << "'.\nRun "
-                         "third_party/face-detection/models/fetch.sh to "
-                         "download it.\n";
-            camera->close();
-            return 1;
-        }
-        std::cout << "Face detection enabled (model: " << faceModel << ").\n";
-    }
-
-    std::unique_ptr<fd::FaceRecognizer> faceRecognizer;
-    fd::FaceDatabase faceDatabase;
-    if (doRecognize || enrollId >= 0) {
-        faceRecognizer = std::make_unique<fd::FaceRecognizer>();
-        fd::FaceRecognizer::Options recOptions;
-        recOptions.model_path = faceRecModel;
-        if (!faceRecognizer->open(recOptions)) {
-            std::cerr << "Could not load the face-recognition model '"
-                      << faceRecModel << "'.\nRun "
-                         "third_party/face-detection/models/fetch.sh to "
-                         "download it.\n";
-            camera->close();
-            return 1;
-        }
-        std::cout << "Face recognition enabled (model: " << faceRecModel
-                  << ").\n";
-
-        if (!faceDbPath.empty() && faceDatabase.load(faceDbPath)) {
-            std::cout << "Loaded " << faceDatabase.size() << " enrolment(s) from "
-                      << faceDbPath << ".\n";
-        } else if (doRecognize && !faceDbPath.empty()) {
-            std::cout << "No face database at '" << faceDbPath
-                      << "'; no one can be recognised yet.\n";
-        }
-    }
-#else
-    if (detectFaces || doRecognize || enrollId >= 0) {
-        std::cerr << "--faces/--recognize/--enroll require a build with "
-                     "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
-        camera->close();
-        return 1;
-    }
-#endif
 
     // ---------------- Single/limited frame-capture path ----------------
     int received = 0;

@@ -142,8 +142,10 @@ with status `0`. It needs no camera and works on its own.
 | `--preview`           | *(off)*   | live preview window (`q`/Esc to quit)                 |
 | `--window-size=<s>`   | `native`  | preview window size: `native` or `<width>x<height>`   |
 | `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
-| `--faces`            | *(off)*   | run face detection on each captured frame             |
+| `--faces`            | *(off)*   | run face detection on each captured frame; drawn on the image in `--preview`/`--stream` |
 | `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
+| `--face-score=<f>`   | *(default)*| minimum detection confidence to report a face       |
+| `--face-detect-width=<px>` | *(default)* | width the detector runs at (0 = native)  |
 | `--recognize`        | *(off)*   | identify each detected face against the enrolled set  |
 | `--face-db=<path>`   | *(none)*  | face database file (load + save)                      |
 | `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
@@ -252,11 +254,22 @@ with status `0`. It needs no camera and works on its own.
 # Fullscreen preview
 ./build/debug/bin/objective-control-app \
   --mode=ip --source=rtsp://host:554/stream --preview --window-fullscreen
+
+# Preview an RTSP camera with the detected faces drawn on the frames
+./build/debug/bin/objective-control-app \
+  --mode=ip --source=rtsp://host:554/stream --preview --faces
 ```
 
 > The preview window is opened at the camera's native resolution by default,
 > so the picture is shown 1:1 rather than stretched. Use `--window-size` to
 > pick a different size (`native`, or `<width>x<height>`).
+
+> Adding `--faces` (or `--recognize`) draws a box around every detected face.
+> A recognised person gets a green box labelled with their id, an unknown
+> face an amber box labelled `unknown`. The same overlay is drawn on the
+> frames served by `--stream`, so the MJPEG page shows it too. Detection
+> costs roughly 25 ms per frame, which caps the preview at a lower frame
+> rate than the raw capture.
 
 ### Exit codes
 
@@ -309,6 +322,25 @@ Detected 2 face(s) in total.
 
 Captured frames are handed to the detector without copying any pixels: `oc::Frame`
 and `fd::Image` share the same dense BGR layout.
+
+The same detector runs in `--preview` and `--stream` mode, where the boxes are
+drawn onto the image instead of only being printed. The preview and the
+MJPEG stream therefore show the faces even though the console stays quiet.
+
+Detection is tunable, which matters for a fixed IP camera whose sub-stream is
+small or whose subject is far away:
+
+```sh
+# Report faces down to 30% confidence, and run the detector on a 480px-wide
+# copy of the frame (cheaper, and catches small faces better)
+./build/debug/bin/objective-control-app \
+    --mode=ip --source=rtsp://host:554/stream --preview --faces \
+    --face-score=0.3 --face-detect-width=480
+```
+
+`--face-detect-width` scales the frame down before detection, so a 1080p
+source costs about the same as a 640x480 one. Set it to `0` to detect at
+native resolution.
 
 #### Face recognition
 
