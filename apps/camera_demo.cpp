@@ -21,7 +21,9 @@
 #endif
 
 #ifdef OC_HAVE_FACE
+#include "face-detection/face/database.hpp"
 #include "face-detection/face/detector.hpp"
+#include "face-detection/face/recognizer.hpp"
 #endif
 
 namespace {
@@ -85,7 +87,7 @@ std::string arg(int argc, char** argv, const std::string& name,
 // Options that are switches: they never take a value.
 bool isBooleanOption(const std::string& name) {
     return name == "preview" || name == "window-fullscreen" ||
-           name == "faces" || name == "help";
+           name == "faces" || name == "recognize" || name == "help";
 }
 
 // Every option the app understands. Anything else is a typo and is reported
@@ -96,6 +98,8 @@ bool isKnownOption(const std::string& name) {
         "frames",  "seconds", "out",       "record", "stream",
         "preview", "window-size", "window-fullscreen", "help",
         "faces",   "face-model",
+        "recognize", "enroll", "face-db", "face-recognition-model",
+        "face-max-distance",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -192,6 +196,20 @@ Options:
   --face-model=<path>    YuNet model file used by --faces
                          (default: third_party/face-detection/models/
                           face_detection_yunet_2023mar.onnx)
+  --recognize            Identify every detected face against the enrolled
+                         set and print the person id (implies --faces)
+  --face-db=<path>       Face database file. Loaded when it exists and
+                         written back when --enroll is used.
+  --enroll=<id>          Enrol the most confident face of the first frame
+                         that contains one, under this person id. Implies
+                         --faces and requires --face-db.
+  --face-recognition-model=<path>
+                         SFace model file used by --recognize/--enroll
+                         (default: third_party/face-detection/models/
+                          face_recognition_sface_2021dec.onnx)
+  --face-max-distance=<f>
+                         Largest cosine distance still counted as a match
+                         (default: 0.4; lower is stricter)
   -h, --help             Show this help and exit
 
 Options take their value with '=' (e.g. --width=640).
@@ -223,6 +241,14 @@ Examples:
 
   # Detect faces in ten frames from a USB camera
   objective-control-app --mode=embedded --source=/dev/video0 --frames=10 --faces
+
+  # Identify faces against a database of enrolled people
+  objective-control-app --mode=embedded --source=/dev/video0 --frames=10 \
+      --recognize --face-db=faces.db
+
+  # Enrol the person in front of the camera as person 42
+  objective-control-app --mode=embedded --source=/dev/video0 --enroll=42 \
+      --face-db=faces.db
 
 Exit codes:
   0  success
@@ -329,6 +355,34 @@ int main(int argc, char** argv) {
     const std::string faceModel = arg(argc, argv, "face-model",
                                       "third_party/face-detection/models/"
                                       "face_detection_yunet_2023mar.onnx");
+    const bool doRecognize = flag(argc, argv, "recognize");
+    const std::string enrollStr = arg(argc, argv, "enroll", "");
+    const std::string faceDbPath = arg(argc, argv, "face-db", "");
+    const std::string faceRecModel = arg(argc, argv, "face-recognition-model",
+                                         "third_party/face-detection/models/"
+                                         "face_recognition_sface_2021dec.onnx");
+    const double maxDistance =
+        std::atof(arg(argc, argv, "face-max-distance", "0.4").c_str());
+
+    // --enroll=<id> names the person to enrol. -1 means "not enrolling".
+    int enrollId = -1;
+    if (!enrollStr.empty()) {
+        try {
+            enrollId = std::stoi(enrollStr);
+        } catch (const std::exception&) {
+            enrollId = -1;
+        }
+        if (enrollId < 0) {
+            std::cerr << "Invalid --enroll value '" << enrollStr
+                      << "' (expected a non-negative integer).\n";
+            return 2;
+        }
+        if (faceDbPath.empty()) {
+            std::cerr << "--enroll requires --face-db=<path> to store the "
+                         "enrolment.\n";
+            return 2;
+        }
+    }
 
     int windowWidth = 0;
     int windowHeight = 0;
@@ -517,10 +571,13 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    // ---------------- Face detection (optional submodule) ----------------
+    // ---------------- Face detection / recognition (optional submodule) ----------------
 #ifdef OC_HAVE_FACE
+    // --recognize and --enroll both need the detector, so they imply --faces.
+    const bool runFaces = detectFaces || doRecognize || enrollId >= 0;
+
     std::unique_ptr<fd::FaceDetector> faceDetector;
-    if (detectFaces) {
+    if (runFaces) {
         faceDetector = std::make_unique<fd::FaceDetector>();
         fd::FaceDetector::Options faceOptions;
         faceOptions.model_path = faceModel;
@@ -534,9 +591,35 @@ int main(int argc, char** argv) {
         }
         std::cout << "Face detection enabled (model: " << faceModel << ").\n";
     }
+
+    std::unique_ptr<fd::FaceRecognizer> faceRecognizer;
+    fd::FaceDatabase faceDatabase;
+    if (doRecognize || enrollId >= 0) {
+        faceRecognizer = std::make_unique<fd::FaceRecognizer>();
+        fd::FaceRecognizer::Options recOptions;
+        recOptions.model_path = faceRecModel;
+        if (!faceRecognizer->open(recOptions)) {
+            std::cerr << "Could not load the face-recognition model '"
+                      << faceRecModel << "'.\nRun "
+                         "third_party/face-detection/models/fetch.sh to "
+                         "download it.\n";
+            camera->close();
+            return 1;
+        }
+        std::cout << "Face recognition enabled (model: " << faceRecModel
+                  << ").\n";
+
+        if (!faceDbPath.empty() && faceDatabase.load(faceDbPath)) {
+            std::cout << "Loaded " << faceDatabase.size() << " enrolment(s) from "
+                      << faceDbPath << ".\n";
+        } else if (doRecognize && !faceDbPath.empty()) {
+            std::cout << "No face database at '" << faceDbPath
+                      << "'; no one can be recognised yet.\n";
+        }
+    }
 #else
-    if (detectFaces) {
-        std::cerr << "--faces requires a build with "
+    if (detectFaces || doRecognize || enrollId >= 0) {
+        std::cerr << "--faces/--recognize/--enroll require a build with "
                      "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
         camera->close();
         return 1;
@@ -546,6 +629,10 @@ int main(int argc, char** argv) {
     // ---------------- Single/limited frame-capture path ----------------
     int received = 0;
     int facesSeen = 0;
+#ifdef OC_HAVE_FACE
+    int recognizedSeen = 0;
+    bool enrolled = false;
+#endif
     for (int attempts = 0; attempts < frameCount * 40; ++attempts) {
         auto frame = camera->grab();
         if (!frame) {
@@ -574,8 +661,52 @@ int main(int argc, char** argv) {
                 std::cout << " (" << face.x << "," << face.y << " "
                           << face.width << "x" << face.height << " score="
                           << face.score << ")";
+
+                if (!faceRecognizer) {
+                    continue;
+                }
+
+                // Identify this face against the enrolled set.
+                fd::Embedding embedding;
+                if (!faceRecognizer->embed(image, face, embedding)) {
+                    std::cout << " -> embedding failed";
+                    continue;
+                }
+                const fd::FaceDatabase::Match match =
+                    faceDatabase.match(embedding,
+                                       static_cast<float>(maxDistance));
+                if (match.matched) {
+                    ++recognizedSeen;
+                    std::cout << " -> person " << match.person_id
+                              << " (distance " << match.distance << ")";
+                } else if (faceDatabase.empty()) {
+                    std::cout << " -> unknown (database is empty)";
+                } else {
+                    std::cout << " -> unknown (distance " << match.distance
+                              << ")";
+                }
             }
             std::cout << '\n';
+
+            // Enrolment takes the most confident face of the first frame
+            // that contains one.
+            if (enrollId >= 0 && !enrolled && !faces.empty()) {
+                const fd::FaceBox* best = &faces.front();
+                for (const fd::FaceBox& face : faces) {
+                    if (face.score > best->score) {
+                        best = &face;
+                    }
+                }
+                if (faceDatabase.enroll(enrollId, image, *best, *faceRecognizer)) {
+                    enrolled = true;
+                    std::cout << "  Enrolled person " << enrollId << " ("
+                              << faceDatabase.size()
+                              << " sample(s) in the database).\n";
+                } else {
+                    std::cerr << "  Could not compute the embedding for the "
+                                 "enrolment.\n";
+                }
+            }
         }
 #endif
 
@@ -597,12 +728,31 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "Captured " << received << " frame(s).\n";
+    int exitCode = 0;
 #ifdef OC_HAVE_FACE
     if (faceDetector) {
         std::cout << "Detected " << facesSeen << " face(s) in total.\n";
     }
+    if (faceRecognizer) {
+        std::cout << "Recognised " << recognizedSeen << " face(s) against the "
+                  << "database.\n";
+    }
+    if (enrollId >= 0) {
+        if (!enrolled) {
+            std::cerr << "No face was detected, so person " << enrollId
+                      << " was not enrolled.\n";
+            exitCode = 1;
+        } else if (!faceDatabase.save(faceDbPath)) {
+            std::cerr << "Could not write the face database to '"
+                      << faceDbPath << "'.\n";
+            exitCode = 1;
+        } else {
+            std::cout << "Saved " << faceDatabase.size() << " enrolment(s) to "
+                      << faceDbPath << ".\n";
+        }
+    }
 #else
     (void)facesSeen;
 #endif
-    return 0;
+    return exitCode;
 }

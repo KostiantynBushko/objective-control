@@ -144,6 +144,11 @@ with status `0`. It needs no camera and works on its own.
 | `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
 | `--faces`            | *(off)*   | run face detection on each captured frame             |
 | `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
+| `--recognize`        | *(off)*   | identify each detected face against the enrolled set  |
+| `--face-db=<path>`   | *(none)*  | face database file (load + save)                      |
+| `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
+| `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
+| `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
 | `-h`, `--help`        | —         | print the option list and exit                         |
 
 > Every option takes its value with `=` (`--width=640`, **not** `--width 640`).
@@ -270,10 +275,11 @@ with status `0`. It needs no camera and works on its own.
 | `Embedded` | `/dev/video0`, `0`   | OpenCV (V4L2)            |
 | `Ip`       | `rtsp://...`, `http://...` (MJPEG or snapshot) | RTSP: OpenCV/FFmpeg; HTTP: built-in client + `imgcodecs` |
 
-### Face detection
+### Face detection and recognition
 
-Face detection is provided by the [`face-detection`](third_party/face-detection)
-submodule and is **off by default**. Enable it when configuring:
+Face detection and recognition are provided by the
+[`face-detection`](third_party/face-detection) submodule and are **off by
+default**. Enable them when configuring:
 
 ```sh
 cmake --preset debug -DOBJECTIVE_CONTROL_ENABLE_FACE=ON
@@ -303,6 +309,98 @@ Detected 2 face(s) in total.
 
 Captured frames are handed to the detector without copying any pixels: `oc::Frame`
 and `fd::Image` share the same dense BGR layout.
+
+#### Face recognition
+
+`--recognize` turns the detected faces into identities. It needs the SFace
+model (fetched by the same `fetch.sh` script) and a database of enrolled
+people.
+
+Enrol a person first — the most confident face of the first frame that
+contains one is stored under the given id:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --enroll=42 --face-db=faces.db
+```
+
+Then identify whoever is in front of the camera:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --frames=10 \
+    --recognize --face-db=faces.db
+```
+
+```
+Face detection enabled (model: third_party/face-detection/models/face_detection_yunet_2023mar.onnx).
+Face recognition enabled (model: third_party/face-detection/models/face_recognition_sface_2021dec.onnx).
+Loaded 1 enrolment(s) from faces.db.
+Frame 0: 1920x1080 (3 ch), 6220800 bytes, t=6454us.
+  faces: 2 (412,180 213x280 score=0.918774) -> person 42 (distance 0.0832154) (1244,201 226x296 score=0.909496) -> unknown (distance 0.571002)
+Captured 1 frame(s).
+Detected 2 face(s) in total.
+Recognised 1 face(s) against the database.
+```
+
+`--enroll` requires `--face-db`, because an enrolment that is never written
+to disk is lost. The database stores **embeddings only, never photographs**,
+and uses the same file format as the submodule's own app, so both can share
+one `faces.db`.
+
+`--face-max-distance` is the cosine-distance cut-off for a match. The default
+of `0.4` is the usual "same person" threshold for SFace; lower it to be
+stricter, raise it if legitimate matches are being rejected.
+
+#### Locating the model files
+
+The model weights are looked up **relative to the current working directory**,
+not relative to the executable. The defaults therefore only resolve when the
+app is launched from the repository root; from anywhere else you get:
+
+```text
+Could not load the detector model: OpenCV(4.10.0) ./modules/dnn/src/onnx/onnx_importer.cpp:277:
+error: (-5:Bad argument) Can't read ONNX file: models/face_detection_yunet_2023mar.onnx
+in function 'ONNXImporter'
+```
+
+| App | Option | Default |
+|-----|--------|---------|
+| `objective-control-app` | `--face-model=<file>` | `third_party/face-detection/models/face_detection_yunet_2023mar.onnx` (CWD-relative) |
+| `objective-control-app` | `--face-recognition-model=<file>` | `third_party/face-detection/models/face_recognition_sface_2021dec.onnx` (CWD-relative) |
+| `face-detection-app` | `--models=<dir>` | `$FACE_DETECTION_MODELS`, else `models` (CWD-relative) |
+
+`face-detection-app` (built from the submodule) resolves the directory in this
+order:
+
+1. `--models=<dir>`
+2. the `FACE_DETECTION_MODELS` environment variable
+3. `./models`, relative to the working directory
+
+`objective-control-app` takes a full file path via `--face-model` and does not
+read `FACE_DETECTION_MODELS`.
+
+Point either app at the weights explicitly:
+
+```sh
+# Parent app — the path is relative to the working directory
+./build/debug/bin/objective-control-app --mode=synthetic --faces \
+    --face-model=third_party/face-detection/models/face_detection_yunet_2023mar.onnx
+
+# Submodule app
+./third_party/face-detection/build/debug/bin/face-detection-app \
+    --image=photo.jpg --models=third_party/face-detection/models
+```
+
+Or export the directory once for the current shell session — no need to edit
+`~/.bashrc`:
+
+```sh
+export FACE_DETECTION_MODELS="$PWD/third_party/face-detection/models"
+```
+
+The simplest option is to launch the apps from the repository root, where the
+relative defaults resolve on their own.
 
 ## CMake options
 
