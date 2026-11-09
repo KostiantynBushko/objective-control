@@ -142,6 +142,8 @@ with status `0`. It needs no camera and works on its own.
 | `--preview`           | *(off)*   | live preview window (`q`/Esc to quit)                 |
 | `--window-size=<s>`   | `native`  | preview window size: `native` or `<width>x<height>`   |
 | `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
+| `--faces`            | *(off)*   | run face detection on each captured frame             |
+| `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
 | `-h`, `--help`        | —         | print the option list and exit                         |
 
 > Every option takes its value with `=` (`--width=640`, **not** `--width 640`).
@@ -268,6 +270,40 @@ with status `0`. It needs no camera and works on its own.
 | `Embedded` | `/dev/video0`, `0`   | OpenCV (V4L2)            |
 | `Ip`       | `rtsp://...`, `http://...` (MJPEG or snapshot) | RTSP: OpenCV/FFmpeg; HTTP: built-in client + `imgcodecs` |
 
+### Face detection
+
+Face detection is provided by the [`face-detection`](third_party/face-detection)
+submodule and is **off by default**. Enable it when configuring:
+
+```sh
+cmake --preset debug -DOBJECTIVE_CONTROL_ENABLE_FACE=ON
+cmake --build --preset debug
+```
+
+The submodule's model weights are not committed; fetch them once:
+
+```sh
+third_party/face-detection/models/fetch.sh
+```
+
+Then run the app with `--faces`:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --frames=10 --faces
+```
+
+```
+Face detection enabled (model: third_party/face-detection/models/face_detection_yunet_2023mar.onnx).
+Frame 0: 1920x1080 (3 ch), 6220800 bytes, t=6454us.
+  faces: 2 (412,180 213x280 score=0.918774) (1244,201 226x296 score=0.909496)
+Captured 1 frame(s).
+Detected 2 face(s) in total.
+```
+
+Captured frames are handed to the detector without copying any pixels: `oc::Frame`
+and `fd::Image` share the same dense BGR layout.
+
 ## CMake options
 
 | Option                                  | Default | Purpose                             |
@@ -277,6 +313,7 @@ with status `0`. It needs no camera and works on its own.
 | `OBJECTIVE_CONTROL_BUILD_APPS`          | `ON`    | Build the example app               |
 | `OBJECTIVE_CONTROL_BUILD_TESTS`         | `ON`    | Build + register tests              |
 | `OBJECTIVE_CONTROL_ENABLE_SANITIZERS`   | `OFF`   | ASan/UBSan in debug builds          |
+| `OBJECTIVE_CONTROL_ENABLE_FACE`         | `OFF`   | Use the face-detection submodule    |
 
 ## Layout
 
