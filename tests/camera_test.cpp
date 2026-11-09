@@ -1,7 +1,9 @@
 #include "objective-control/camera/camera.hpp"
 #include "objective-control/version.hpp"
 
+#include <chrono>
 #include <iostream>
+#include <thread>
 
 namespace {
 
@@ -34,6 +36,33 @@ int main() {
 
     cam->close();
     check(!cam->isOpen(), "null backend reports closed after close");
+
+    // Live mode asks a backend for the newest frame instead of the oldest
+    // buffered one. Backends that do not buffer must be unaffected by it.
+    auto synth = Camera::create(CameraKind::Synthetic);
+    check(static_cast<bool>(synth), "synthetic backend is created");
+
+    CameraConfig liveCfg;
+    liveCfg.kind = CameraKind::Synthetic;
+    liveCfg.width = 64;
+    liveCfg.height = 48;
+    liveCfg.live = true;
+
+    check(synth->open(liveCfg), "synthetic backend opens in live mode");
+    const auto first = synth->grab();
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    const auto second = synth->grab();
+    check(first.has_value() && second.has_value(),
+          "synthetic backend returns frames in live mode");
+    if (first && second) {
+        check(first->width == 64 && first->height == 48,
+              "synthetic frame honours the requested size");
+        // The timestamp is what tells a consumer how old a frame is, so it
+        // has to advance with the clock.
+        check(second->timestamp_us > first->timestamp_us,
+              "synthetic frame timestamp advances with the clock");
+    }
+    synth->close();
 
     // Version header is populated by CMake at configure time.
     const std::string version = OC_VERSION_STRING;

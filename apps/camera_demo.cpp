@@ -187,8 +187,10 @@ Options:
                          codec (.mp4 or .avi)
   --stream=<port>        Serve MJPEG over HTTP on <port>; open
                          http://localhost:<port>/ in a browser. Runs until
-                         Ctrl+C. Several clients may watch at once.
-  --preview              Open a live preview window; press 'q' or Esc to quit
+                         Ctrl+C. Several clients may watch at once. Always
+                         serves the newest frame the camera sent.
+  --preview              Open a live preview window; press 'q' or Esc to quit.
+                         Always shows the newest frame the camera sent
   --window-size=<size>   Preview window size: native (default) or <width>x<height>
   --window-fullscreen    Make the preview window fullscreen
   --faces                Run face detection on each captured frame and
@@ -495,6 +497,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     config.source = source;
+
+    // A preview and an MJPEG stream are live: the consumer is usually
+    // slower than the camera (decoding, drawing, JPEG encoding all take
+    // time), so the backend has to hand out the newest frame rather than
+    // the oldest one it has buffered. A recording keeps every frame, so it
+    // stays on the lossless path.
+    config.live = preview || streamPort > 0;
 
     auto camera = oc::Camera::create(config.kind);
     if (!camera) {

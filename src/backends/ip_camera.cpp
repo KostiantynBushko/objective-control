@@ -2,6 +2,7 @@
 
 #include "backends/http_mjpeg.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -20,7 +21,8 @@ bool isRtsp(const std::string& url) {
 }
 
 #ifdef OC_HAVE_OPENCV
-std::optional<Frame> matToFrame(const cv::Mat& image);
+std::optional<Frame> matToFrame(const cv::Mat& image,
+                             double timestamp_ms = 0.0);
 
 // RTSP (or any FFmpeg-decoded stream) backend using cv::VideoCapture.
 class RtspCamera final : public Camera {
@@ -33,6 +35,7 @@ public:
                 return false;
             }
         }
+        live_ = config.live;
         opened_ = true;
         return true;
     }
@@ -48,15 +51,64 @@ public:
 
     std::optional<Frame> grab() override {
         cv::Mat image;
-        if (!capture_.read(image) || image.empty()) {
+        if (live_) {
+            if (!grabNewest(image)) {
+                return std::nullopt;
+            }
+        } else if (!capture_.read(image) || image.empty()) {
             return std::nullopt;
         }
-        return matToFrame(image);
+        return matToFrame(image, capture_.get(cv::CAP_PROP_POS_MSEC));
     }
 
 private:
+    /// Grabs the newest decoded frame and throws away the ones that piled
+    /// up behind it.
+    ///
+    /// VideoCapture decodes into a queue and read() hands back the OLDEST
+    /// frame in it. When the consumer is slower than the camera the queue
+    /// only grows, so every frame that comes out is older than the last and
+    /// the preview falls further and further behind.
+    ///
+    /// grab() advances the decoder and decodes one frame, retrieve()
+    /// converts the frame that was decoded last. Grabbing repeatedly and
+    /// retrieving once therefore skips over the queued frames and yields
+    /// the newest one. How many frames to skip is decided by how long the
+    /// grab took: one that returns at once means the decoder still had a
+    /// frame queued, one that waits about a frame period means the queue
+    /// was empty and the frame in hand is already the newest.
+    bool grabNewest(cv::Mat& out) {
+        bool decoded = false;
+        for (int i = 0; i < kMaxSkip; ++i) {
+            const auto start = std::chrono::steady_clock::now();
+            if (!capture_.grab()) {
+                if (!decoded) {
+                    return false;
+                }
+                break;
+            }
+            decoded = true;
+            const auto waited =
+                std::chrono::steady_clock::now() - start;
+            if (waited > kQueuedGrabWait) {
+                // The decoder had to wait for the network, so there was
+                // nothing left in the queue: this frame is the newest.
+                break;
+            }
+        }
+        return decoded && capture_.retrieve(out) && !out.empty();
+    }
+
+    /// A grab() that returns faster than this found a frame already queued.
+    static constexpr auto kQueuedGrabWait = std::chrono::milliseconds(8);
+
+    /// Upper bound on the frames skipped per grab, so a stalled decoder
+    /// cannot keep the caller waiting forever.
+    static constexpr int kMaxSkip = 60;
+
     cv::VideoCapture capture_;
     bool opened_ = false;
+    bool live_ = false;
 };
 #endif
 
@@ -137,12 +189,14 @@ private:
 };
 
 // Converts a BGR cv::Mat into a Frame (deep copy).
-std::optional<Frame> matToFrame(const cv::Mat& image) {
+std::optional<Frame> matToFrame(const cv::Mat& image, double timestamp_ms) {
     Frame frame;
     frame.width = image.cols;
     frame.height = image.rows;
     frame.channels = image.channels();
-    frame.timestamp_us = 0;
+    // The source presentation time, as the embedded backend reports it. It
+    // is the only handle on how old a frame is, so it is worth keeping.
+    frame.timestamp_us = static_cast<std::int64_t>(timestamp_ms) * 1000;
 
     const std::size_t bytes =
         static_cast<std::size_t>(image.total()) * image.elemSize();

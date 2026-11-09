@@ -38,6 +38,19 @@ struct CameraConfig {
     int width = 1920;
     int height = 1080;
     int fps = 30;
+
+    /// Live mode: hand out the newest frame instead of the oldest one the
+    /// backend has buffered.
+    ///
+    /// A network backend keeps decoding into a queue. When the consumer is
+    /// slower than the camera, that queue only grows and every frame handed
+    /// out is older than the last -- the preview then shows the scene as it
+    /// was several seconds ago. Live mode discards the frames that piled up
+    /// so the consumer always sees the current picture.
+    ///
+    /// Enable it for previews and live streaming. Leave it off when every
+    /// frame has to be kept, such as a recording.
+    bool live = false;
 };
 
 /// Abstract camera interface implemented by each backend.

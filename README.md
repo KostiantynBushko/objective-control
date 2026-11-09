@@ -264,6 +264,13 @@ with status `0`. It needs no camera and works on its own.
 > so the picture is shown 1:1 rather than stretched. Use `--window-size` to
 > pick a different size (`native`, or `<width>x<height>`).
 
+> The preview and `--stream` always show the **newest** frame the camera has
+> sent. A network backend decodes into a queue, and a consumer that is slower
+> than the camera would otherwise be handed the oldest queued frame — the
+> picture would then be several seconds behind. Frames that piled up are
+> dropped instead. A recording (`--record`) keeps every frame and is not
+> affected.
+
 > Adding `--faces` (or `--recognize`) draws a box around every detected face.
 > A recognised person gets a green box labelled with their id, an unknown
 > face an amber box labelled `unknown`. The same overlay is drawn on the
@@ -341,6 +348,12 @@ small or whose subject is far away:
 `--face-detect-width` scales the frame down before detection, so a 1080p
 source costs about the same as a 640x480 one. Set it to `0` to detect at
 native resolution.
+
+Detection dominates the per-frame cost, and the per-frame cost decides how
+smooth the preview is. Measured on a 1080p source, one frame of detection
+costs about 8 ms at the default 960px width and about 2.5 ms at 480px.
+Lowering the width is the cheapest way to buy back frame rate; a camera
+sub-stream is even better, because it cuts the decode and the copies too.
 
 #### Face recognition
 
