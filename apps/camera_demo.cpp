@@ -5,9 +5,12 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <csignal>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 
@@ -18,6 +21,35 @@
 #endif
 
 namespace {
+// Set from the SIGINT/SIGTERM handler. It must be lock-free so that storing
+// from a signal handler is safe.
+std::atomic<bool> g_stop{false};
+
+// SIGINT/SIGTERM handler: ask the loops to finish so the camera and the
+// sockets are released cleanly instead of being torn down mid-frame.
+void onStopSignal(int) {
+    g_stop.store(true);
+}
+
+// Parses "native" or "<width>x<height>" into an explicit window size.
+// Returns false when the spec requests native sizing or is malformed.
+bool parseWindowSize(const std::string& spec, int& width, int& height) {
+    if (spec.empty() || spec == "native") {
+        return false;
+    }
+    const auto x = spec.find_first_of("xX");
+    if (x == std::string::npos) {
+        return false;
+    }
+    try {
+        width = std::stoi(spec.substr(0, x));
+        height = std::stoi(spec.substr(x + 1));
+    } catch (const std::exception&) {
+        return false;
+    }
+    return width > 0 && height > 0;
+}
+
 // True if a bare "--<name>" flag is present (no value).
 bool flag(int argc, char** argv, const std::string& name) {
     const std::string needle = "--" + name;
@@ -109,16 +141,33 @@ bool writeFrame(cv::VideoWriter& writer, const oc::Frame& frame) {
 
 } // namespace
 
+static_assert(std::atomic<bool>::is_always_lock_free,
+              "the signal handler requires a lock-free atomic");
+
 int main(int argc, char** argv) {
+    std::signal(SIGINT, onStopSignal);
+    std::signal(SIGTERM, onStopSignal);
+
     const std::string mode = arg(argc, argv, "mode", "null");
     const std::string source = arg(argc, argv, "source", "");
     const std::string outPath = arg(argc, argv, "out", "");
     const std::string recordPath = arg(argc, argv, "record", "");
     const int streamPort = std::atoi(arg(argc, argv, "stream", "0").c_str());
     const bool preview = flag(argc, argv, "preview");
+    const bool fullscreen = flag(argc, argv, "window-fullscreen");
     const std::string framesStr = arg(argc, argv, "frames", "1");
     const int frameCount = std::max(1, std::atoi(framesStr.c_str()));
     const double seconds = std::max(0.0, std::atof(arg(argc, argv, "seconds", "5").c_str()));
+
+    int windowWidth = 0;
+    int windowHeight = 0;
+    const std::string windowSizeSpec = arg(argc, argv, "window-size", "native");
+    if (!parseWindowSize(windowSizeSpec, windowWidth, windowHeight)) {
+        if (windowSizeSpec != "native" && !windowSizeSpec.empty()) {
+            std::cerr << "Ignoring invalid --window-size='" << windowSizeSpec
+                      << "' (expected 'native' or '<width>x<height>').\n";
+        }
+    }
 
     oc::CameraConfig config;
     config.width = std::atoi(arg(argc, argv, "width", "1920").c_str());
@@ -157,8 +206,6 @@ int main(int argc, char** argv) {
     // ---------------- Live streaming / preview -------------
     if (streamPort > 0 || preview) {
 #ifdef OC_HAVE_OPENCV
-        std::atomic<bool> stop{false};
-
         const auto period = std::chrono::microseconds(
             1000000 / std::max(1, config.fps));
         auto nextFrame = std::chrono::steady_clock::now();
@@ -166,7 +213,7 @@ int main(int argc, char** argv) {
         // Grab -> throttle to ~fps -> emit as a BGR cv::Mat. Returns false
         // once stop is requested or the camera stops producing frames.
         auto grabFrame = [&](cv::Mat& out) -> bool {
-            while (!stop.load()) {
+            while (!g_stop.load()) {
                 auto frame = camera->grab();
                 if (frame) {
                     cv::Mat view;
@@ -188,7 +235,7 @@ int main(int argc, char** argv) {
             std::cout << "Streaming to http://localhost:" << streamPort
                       << "/  (Ctrl+C to stop)\n";
             apps::MjpegServer server;
-            if (!server.serve(streamPort, grabFrame, stop)) {
+            if (!server.serve(streamPort, grabFrame, g_stop)) {
                 std::cerr << "Failed to start stream on port " << streamPort
                           << ".\n";
                 camera->close();
@@ -200,12 +247,30 @@ int main(int argc, char** argv) {
 
         // Live preview window (requires a display).
         std::cout << "Live preview (press 'q' or Esc to quit)\n";
+        const std::string kWindowTitle = "objective-control: camera";
+        // WINDOW_NORMAL keeps the window resizable; without it the window
+        // manager tends to scale the frame to the whole screen.
+        cv::namedWindow(kWindowTitle, cv::WINDOW_NORMAL);
+
         cv::Mat image;
-        while (!stop.load()) {
+        bool windowSized = false;
+        while (!g_stop.load()) {
             if (!grabFrame(image)) {
                 break;
             }
-            cv::imshow("objective-control: camera", image);
+            cv::imshow(kWindowTitle, image);
+            if (!windowSized) {
+                // Size the window to the frame itself so the picture is
+                // neither stretched nor cropped.
+                const int w = windowWidth > 0 ? windowWidth : image.cols;
+                const int h = windowHeight > 0 ? windowHeight : image.rows;
+                cv::resizeWindow(kWindowTitle, w, h);
+                if (fullscreen) {
+                    cv::setWindowProperty(kWindowTitle, cv::WND_PROP_FULLSCREEN,
+                                          cv::WINDOW_FULLSCREEN);
+                }
+                windowSized = true;
+            }
             const int key = cv::waitKey(1) & 0xff;
             if (key == 'q' || key == 27) {
                 break;

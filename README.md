@@ -158,13 +158,24 @@ does one of: grab frames, save a frame, record video, or stream live.
 
 ```sh
 # MJPEG-over-HTTP, viewable in a browser at http://localhost:8080/
+# Several clients may watch at once; each receives the newest frame.
 ./build/debug/bin/objective-control-app \
   --mode=embedded --source=/dev/video0 --fps=15 --stream=8080
 
 # Live preview window (requires a display)
 ./build/debug/bin/objective-control-app \
   --mode=embedded --source=/dev/video0 --preview
+
+# Preview in a specific window size, or fullscreen
+./build/debug/bin/objective-control-app \
+  --mode=ip --source=rtsp://host:554/stream --preview --window-size=1280x720
+./build/debug/bin/objective-control-app \
+  --mode=ip --source=rtsp://host:554/stream --preview --window-fullscreen
 ```
+
+> The preview window is opened at the camera's native resolution by default,
+> so the picture is shown 1:1 rather than stretched. Use `--window-size` to
+> pick a different size (`native`, or `<width>x<height>`).
 
 ### Flags
 
@@ -181,6 +192,8 @@ does one of: grab frames, save a frame, record video, or stream live.
 | `--record=<path>` | record video to `.mp4` or `.avi`                     |
 | `--stream=<port>` | serve MJPEG over HTTP on `<port>` (runs until Ctrl+C)|
 | `--preview`       | live preview window (`q`/Esc to quit)                |
+| `--window-size`   | preview window size: `native` (default) or `W x H`   |
+| `--window-fullscreen` | make the preview window fullscreen             |
 
 > **Security note:** the MJPEG stream server has no authentication and is
 > intended for localhost or trusted networks only.
