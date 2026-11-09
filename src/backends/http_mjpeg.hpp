@@ -322,7 +322,12 @@ private:
                     return true;
                 }
             }
-            out.append(&buf_[pos_], len_ - pos_);
+            // The buffer may not have been allocated yet on the very first
+            // call (fill() is what resizes it), so guard the append instead
+            // of indexing an empty vector.
+            if (len_ > pos_) {
+                out.append(&buf_[pos_], len_ - pos_);
+            }
             pos_ = len_;
             if (!fill()) {
                 return !out.empty();
