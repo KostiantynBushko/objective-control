@@ -24,6 +24,7 @@
       "name": "asan",
       "displayName": "Debug + sanitizers",
       "inherits": "debug",
+      "binaryDir": "${sourceDir}/build/asan",
       "cacheVariables": {
         "OBJECTIVE_CONTROL_ENABLE_SANITIZERS": "ON"
       }
