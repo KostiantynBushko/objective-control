@@ -1,3 +1,4 @@
 [submodule "third_party/face-detection"]
 	path = third_party/face-detection
-	url = /home/kbush/milproj/face-detection.git
+	url = git@github.com:KostiantynBushko/face-detection.git
+	branch = master
