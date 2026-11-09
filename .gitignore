@@ -1,0 +1,22 @@
+# Build directories
+build/
+
+# CMake / compiler metadata
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+*.ninja
+
+# Agent / workspace tooling (machine-local state)
+.agentworkspace.json
+
+# Local test artifacts (not referenced by sources)
+clip.mp4
+frame.ppm
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
