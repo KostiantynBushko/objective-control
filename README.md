@@ -291,3 +291,21 @@ tests/camera_test.cpp                         Smoke test (no external test deps)
 cmake/                                        Dependency + warning helpers
 CMakePresets.json                             Debug / release / asan presets
 ```
+
+## Related projects
+
+| Project | Description |
+|---------|-------------|
+| [`third_party/face-detection`](third_party/face-detection) | Standalone face detection and recognition library (OpenCV YuNet + SFace, C++20). It is its own git repository, currently living in-tree; it will be promoted to a git submodule once it has a remote of its own. |
+
+`face-detection`'s `fd::Image` has exactly the same layout as `oc::Frame`
+(dense, row-major BGR or grayscale), so a captured frame can be handed to the
+face pipeline without copying a single pixel:
+
+```cpp
+fd::Image frame;
+frame.width   = captured->width;
+frame.height  = captured->height;
+frame.channels = captured->channels;
+frame.data    = captured->data;   // no copy
+```
