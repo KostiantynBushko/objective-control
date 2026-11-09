@@ -15,7 +15,7 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
 - Backends: `Null` (built-in), `Synthetic` (built-in test pattern), `Embedded`
   (OpenCV V4L2), `Ip` (network camera — RTSP / HTTP MJPEG / HTTP snapshot).
 - Example CLI app with modes for frame capture, video recording, MJPEG
-  streaming, and live preview.
+  streaming, and live preview, plus a built-in `--help`.
 - Optional dependencies degrade gracefully (e.g. no OpenCV → still builds with
   the built-in backends).
 - CMake presets (debug / release / asan) and strict compiler warnings.
@@ -115,9 +115,40 @@ Key types:
 ## Command-line app
 
 The example app (`objective-control-app`) selects a backend with `--mode` and
-does one of: grab frames, save a frame, record video, or stream live.
+does one of: grab frames, save a frame, record video, stream live, or open a
+preview window.
 
-### Modes
+```sh
+./build/debug/bin/objective-control-app --help
+```
+
+`--help` (or `-h`) prints the complete option list with defaults and exits
+with status `0`. It needs no camera and works on its own.
+
+### Options
+
+| Option                | Default   | Meaning                                               |
+|-----------------------|-----------|-------------------------------------------------------|
+| `--mode=<m>`          | `null`    | `null`, `embedded`, `ip`, or `synthetic`              |
+| `--source=<s>`        | *(empty)* | device path/index (`embedded`) or URL (`ip`)          |
+| `--width=N`           | `1920`    | requested frame width                                  |
+| `--height=N`          | `1080`    | requested frame height                                 |
+| `--fps=N`             | `30`      | requested frame rate                                   |
+| `--frames=N`          | `1`       | number of frames to grab                               |
+| `--seconds=N`         | `5`       | recording duration in seconds                          |
+| `--out=<path>`        | *(none)*  | save the first captured frame as a PPM (P6) image     |
+| `--record=<path>`     | *(none)*  | record video to `.mp4` or `.avi`                       |
+| `--stream=<port>`     | *(off)*   | serve MJPEG over HTTP on `<port>` (runs until Ctrl+C) |
+| `--preview`           | *(off)*   | live preview window (`q`/Esc to quit)                 |
+| `--window-size=<s>`   | `native`  | preview window size: `native` or `<width>x<height>`   |
+| `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
+| `-h`, `--help`        | —         | print the option list and exit                         |
+
+> Every option takes its value with `=` (`--width=640`, **not** `--width 640`).
+> An unknown option, a stray argument, or an invalid `--mode` exits with
+> status `2` and a one-line explanation.
+
+### Choosing a backend (`--mode`)
 
 ```sh
 # Embedded: USB/CSI device (path or numeric index)
@@ -139,22 +170,49 @@ does one of: grab frames, save a frame, record video, or stream live.
 ./build/debug/bin/objective-control-app --mode=null
 ```
 
-### Capture a single frame (saved as PPM)
+### Capture frames (`--frames`, `--width`, `--height`, `--fps`)
 
 ```sh
+# One frame at the requested resolution (the default)
+./build/debug/bin/objective-control-app \
+  --mode=synthetic --width=640 --height=480
+
+# Grab 10 frames and print their size and timestamp
+./build/debug/bin/objective-control-app \
+  --mode=embedded --source=/dev/video0 --frames=10
+
+# Ask the camera for 1080p30
+./build/debug/bin/objective-control-app \
+  --mode=embedded --source=/dev/video0 --width=1920 --height=1080 --fps=30
+```
+
+### Save a single frame (`--out`)
+
+```sh
+# Save the first captured frame as a binary PPM (P6) image
 ./build/debug/bin/objective-control-app \
   --mode=synthetic --width=640 --height=480 --out=frame.ppm
 ```
 
-### Record a few seconds of video (OpenCV + FFmpeg)
+> PPM output needs a 3-channel (BGR) frame.
+
+### Record video (`--record`, `--seconds`)
 
 ```sh
+# Record a few seconds of video (OpenCV + FFmpeg)
 ./build/debug/bin/objective-control-app \
   --mode=synthetic --width=640 --height=480 --fps=30 \
   --seconds=5 --record=clip.mp4      # or clip.avi
+
+# Record 30 seconds from a real device at 1080p30
+./build/debug/bin/objective-control-app \
+  --mode=embedded --source=/dev/video0 --width=1920 --height=1080 --fps=30 \
+  --seconds=30 --record=clip.mp4
 ```
 
-### Stream live video (no saving)
+> The extension picks the codec: `.mp4` → MPEG-4 Part 2, `.avi` → MJPG.
+
+### Stream live video (`--stream`)
 
 ```sh
 # MJPEG-over-HTTP, viewable in a browser at http://localhost:8080/
@@ -162,13 +220,29 @@ does one of: grab frames, save a frame, record video, or stream live.
 ./build/debug/bin/objective-control-app \
   --mode=embedded --source=/dev/video0 --fps=15 --stream=8080
 
-# Live preview window (requires a display)
+# Stream an IP camera to a browser
+./build/debug/bin/objective-control-app \
+  --mode=ip --source=rtsp://host:554/stream --fps=15 --stream=8080
+```
+
+> `http://localhost:<port>/` serves a small HTML page embedding the stream;
+> `http://localhost:<port>/stream` is the raw MJPEG stream.
+>
+> **Security note:** the MJPEG stream server has no authentication and is
+> intended for localhost or trusted networks only.
+
+### Live preview (`--preview`, `--window-size`, `--window-fullscreen`)
+
+```sh
+# Live preview window (requires a display); press 'q' or Esc to quit
 ./build/debug/bin/objective-control-app \
   --mode=embedded --source=/dev/video0 --preview
 
-# Preview in a specific window size, or fullscreen
+# Preview in a specific window size
 ./build/debug/bin/objective-control-app \
   --mode=ip --source=rtsp://host:554/stream --preview --window-size=1280x720
+
+# Fullscreen preview
 ./build/debug/bin/objective-control-app \
   --mode=ip --source=rtsp://host:554/stream --preview --window-fullscreen
 ```
@@ -177,26 +251,13 @@ does one of: grab frames, save a frame, record video, or stream live.
 > so the picture is shown 1:1 rather than stretched. Use `--window-size` to
 > pick a different size (`native`, or `<width>x<height>`).
 
-### Flags
+### Exit codes
 
-| Flag              | Meaning                                              |
-|-------------------|------------------------------------------------------|
-| `--mode=<m>`      | `null`, `embedded`, `ip`, or `synthetic`             |
-| `--source=<s>`    | device path/index (embedded) or URL (ip)             |
-| `--width=N`       | requested frame width (default 1920)                 |
-| `--height=N`      | requested frame height (default 1080)                |
-| `--fps=N`         | requested frame rate (default 30)                    |
-| `--frames=N`      | number of frames to grab (default 1)                 |
-| `--seconds=N`     | recording duration in seconds (default 5)            |
-| `--out=<path>`    | save the first frame as PPM                          |
-| `--record=<path>` | record video to `.mp4` or `.avi`                     |
-| `--stream=<port>` | serve MJPEG over HTTP on `<port>` (runs until Ctrl+C)|
-| `--preview`       | live preview window (`q`/Esc to quit)                |
-| `--window-size`   | preview window size: `native` (default) or `W x H`   |
-| `--window-fullscreen` | make the preview window fullscreen             |
-
-> **Security note:** the MJPEG stream server has no authentication and is
-> intended for localhost or trusted networks only.
+| Code | Meaning                                                            |
+|------|--------------------------------------------------------------------|
+| `0`  | success                                                            |
+| `1`  | runtime error (camera could not be opened, no frames captured, ...) |
+| `2`  | bad usage (unknown option, invalid mode)                          |
 
 ## Backends
 

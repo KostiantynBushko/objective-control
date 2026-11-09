@@ -74,6 +74,148 @@ std::string arg(int argc, char** argv, const std::string& name,
     return fallback;
 }
 
+// ---------------------------------------------------------------------------
+// Command-line help and validation
+// ---------------------------------------------------------------------------
+
+// Options that are switches: they never take a value.
+bool isBooleanOption(const std::string& name) {
+    return name == "preview" || name == "window-fullscreen" || name == "help";
+}
+
+// Every option the app understands. Anything else is a typo and is reported
+// rather than silently ignored.
+bool isKnownOption(const std::string& name) {
+    static const char* const kOptions[] = {
+        "mode",    "source", "width",       "height", "fps",
+        "frames",  "seconds", "out",       "record", "stream",
+        "preview", "window-size", "window-fullscreen", "help",
+    };
+    for (const char* known : kOptions) {
+        if (name == known) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// True when "-h" or "--help" was requested.
+bool wantsHelp(int argc, char** argv) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-h" || a == "--help") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Rejects unknown options and stray arguments. Every option carries its
+// value with '=' (--width=640), so a standalone word is always a mistake.
+bool validateArgs(int argc, char** argv) {
+    bool ok = true;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+
+        if (a == "-h" || a == "--help") {
+            continue;
+        }
+
+        if (a.rfind("--", 0) != 0) {
+            if (a.rfind("-", 0) == 0) {
+                std::cerr << "Unknown option '" << a << "'.\n";
+            } else {
+                std::cerr << "Unexpected argument '" << a
+                          << "' (options take the form --name=value).\n";
+            }
+            ok = false;
+            continue;
+        }
+
+        const auto eq = a.find('=');
+        const std::string name =
+            (eq == std::string::npos) ? a.substr(2) : a.substr(2, eq - 2);
+
+        if (!isKnownOption(name)) {
+            std::cerr << "Unknown option '" << a << "'.\n";
+            ok = false;
+        } else if (eq != std::string::npos && isBooleanOption(name)) {
+            std::cerr << "Option '--" << name
+                      << "' is a switch and takes no value.\n";
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+// Prints the usage text. Mirrored by the "Command-line app" section of
+// README.md, so keep the two in sync.
+void printUsage(std::ostream& out) {
+    out << R"USAGE(objective-control-app - capture, record and stream camera frames
+
+Usage:
+  objective-control-app [options]
+
+Options:
+  --mode=<mode>          Camera backend (default: null):
+                           null       no-op placeholder
+                           embedded  local USB/CSI/MIPI device
+                           ip        network camera (RTSP / HTTP)
+                           synthetic built-in moving test pattern
+  --source=<source>      Source for the backend. For --mode=embedded a device
+                         path or index (/dev/video0, 0); for --mode=ip a URL
+                         (rtsp://host:554/stream, http://host/?action=stream,
+                         http://host/snapshot.jpg).
+  --width=<px>           Requested frame width (default: 1920)
+  --height=<px>          Requested frame height (default: 1080)
+  --fps=<n>              Requested frame rate (default: 30)
+  --frames=<n>           Number of frames to grab (default: 1)
+  --seconds=<n>          Recording duration in seconds (default: 5)
+  --out=<path>           Save the first captured frame as a binary PPM (P6)
+  --record=<path>        Record video to <path>; the extension picks the
+                         codec (.mp4 or .avi)
+  --stream=<port>        Serve MJPEG over HTTP on <port>; open
+                         http://localhost:<port>/ in a browser. Runs until
+                         Ctrl+C. Several clients may watch at once.
+  --preview              Open a live preview window; press 'q' or Esc to quit
+  --window-size=<size>   Preview window size: native (default) or <width>x<height>
+  --window-fullscreen    Make the preview window fullscreen
+  -h, --help             Show this help and exit
+
+Options take their value with '=' (e.g. --width=640).
+
+Examples:
+  # Built-in test pattern, no hardware needed
+  objective-control-app --mode=synthetic --width=640 --height=480
+
+  # Save one frame as a PPM image
+  objective-control-app --mode=embedded --source=/dev/video0 --out=frame.ppm
+
+  # Grab 10 frames and print their size
+  objective-control-app --mode=embedded --source=0 --frames=10
+
+  # Record five seconds to MP4
+  objective-control-app --mode=embedded --source=/dev/video0 --fps=30 \
+      --seconds=5 --record=clip.mp4
+
+  # Stream over HTTP (open http://localhost:8080/)
+  objective-control-app --mode=ip --source=rtsp://host:554/stream --stream=8080
+
+  # Live preview at 1280x720
+  objective-control-app --mode=embedded --source=/dev/video0 --preview \
+      --window-size=1280x720
+
+  # Fullscreen preview of an IP camera
+  objective-control-app --mode=ip --source=http://host/?action=stream \
+      --preview --window-fullscreen
+
+Exit codes:
+  0  success
+  1  runtime error (camera could not be opened, no frames captured, ...)
+  2  bad usage (unknown option, invalid mode)
+)USAGE";
+}
+
 // Writes a binary PPM (P6) image. Frames are BGR, PPM expects RGB.
 bool savePpm(const oc::Frame& frame, const std::string& path) {
     if (frame.channels != 3) {
@@ -147,6 +289,16 @@ static_assert(std::atomic<bool>::is_always_lock_free,
 int main(int argc, char** argv) {
     std::signal(SIGINT, onStopSignal);
     std::signal(SIGTERM, onStopSignal);
+
+    // --help wins over everything else, including a bad option elsewhere.
+    if (wantsHelp(argc, argv)) {
+        printUsage(std::cout);
+        return 0;
+    }
+    if (!validateArgs(argc, argv)) {
+        std::cerr << "Run with --help for the list of options.\n";
+        return 2;
+    }
 
     const std::string mode = arg(argc, argv, "mode", "null");
     const std::string source = arg(argc, argv, "source", "");
