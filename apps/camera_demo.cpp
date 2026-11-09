@@ -20,6 +20,10 @@
 #include "mjpeg_stream.hpp"
 #endif
 
+#ifdef OC_HAVE_FACE
+#include "face-detection/face/detector.hpp"
+#endif
+
 namespace {
 // Set from the SIGINT/SIGTERM handler. It must be lock-free so that storing
 // from a signal handler is safe.
@@ -80,7 +84,8 @@ std::string arg(int argc, char** argv, const std::string& name,
 
 // Options that are switches: they never take a value.
 bool isBooleanOption(const std::string& name) {
-    return name == "preview" || name == "window-fullscreen" || name == "help";
+    return name == "preview" || name == "window-fullscreen" ||
+           name == "faces" || name == "help";
 }
 
 // Every option the app understands. Anything else is a typo and is reported
@@ -90,6 +95,7 @@ bool isKnownOption(const std::string& name) {
         "mode",    "source", "width",       "height", "fps",
         "frames",  "seconds", "out",       "record", "stream",
         "preview", "window-size", "window-fullscreen", "help",
+        "faces",   "face-model",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -180,6 +186,12 @@ Options:
   --preview              Open a live preview window; press 'q' or Esc to quit
   --window-size=<size>   Preview window size: native (default) or <width>x<height>
   --window-fullscreen    Make the preview window fullscreen
+  --faces                Run face detection on each captured frame and
+                         report how many faces were found (requires a build
+                         with OBJECTIVE_CONTROL_ENABLE_FACE=ON)
+  --face-model=<path>    YuNet model file used by --faces
+                         (default: third_party/face-detection/models/
+                          face_detection_yunet_2023mar.onnx)
   -h, --help             Show this help and exit
 
 Options take their value with '=' (e.g. --width=640).
@@ -208,6 +220,9 @@ Examples:
   # Fullscreen preview of an IP camera
   objective-control-app --mode=ip --source=http://host/?action=stream \
       --preview --window-fullscreen
+
+  # Detect faces in ten frames from a USB camera
+  objective-control-app --mode=embedded --source=/dev/video0 --frames=10 --faces
 
 Exit codes:
   0  success
@@ -310,6 +325,10 @@ int main(int argc, char** argv) {
     const std::string framesStr = arg(argc, argv, "frames", "1");
     const int frameCount = std::max(1, std::atoi(framesStr.c_str()));
     const double seconds = std::max(0.0, std::atof(arg(argc, argv, "seconds", "5").c_str()));
+    const bool detectFaces = flag(argc, argv, "faces");
+    const std::string faceModel = arg(argc, argv, "face-model",
+                                      "third_party/face-detection/models/"
+                                      "face_detection_yunet_2023mar.onnx");
 
     int windowWidth = 0;
     int windowHeight = 0;
@@ -498,8 +517,35 @@ int main(int argc, char** argv) {
 #endif
     }
 
+    // ---------------- Face detection (optional submodule) ----------------
+#ifdef OC_HAVE_FACE
+    std::unique_ptr<fd::FaceDetector> faceDetector;
+    if (detectFaces) {
+        faceDetector = std::make_unique<fd::FaceDetector>();
+        fd::FaceDetector::Options faceOptions;
+        faceOptions.model_path = faceModel;
+        if (!faceDetector->open(faceOptions)) {
+            std::cerr << "Could not load the face-detection model '"
+                      << faceModel << "'.\nRun "
+                         "third_party/face-detection/models/fetch.sh to "
+                         "download it.\n";
+            camera->close();
+            return 1;
+        }
+        std::cout << "Face detection enabled (model: " << faceModel << ").\n";
+    }
+#else
+    if (detectFaces) {
+        std::cerr << "--faces requires a build with "
+                     "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
+        camera->close();
+        return 1;
+    }
+#endif
+
     // ---------------- Single/limited frame-capture path ----------------
     int received = 0;
+    int facesSeen = 0;
     for (int attempts = 0; attempts < frameCount * 40; ++attempts) {
         auto frame = camera->grab();
         if (!frame) {
@@ -510,6 +556,28 @@ int main(int argc, char** argv) {
                   << frame->height << " (" << frame->channels
                   << " ch), " << frame->data.size() << " bytes, t="
                   << frame->timestamp_us << "us.\n";
+
+#ifdef OC_HAVE_FACE
+        if (faceDetector) {
+            // oc::Frame and fd::Image share the same dense BGR layout, so
+            // the frame can be handed over without copying any pixels.
+            fd::Image image;
+            image.width = frame->width;
+            image.height = frame->height;
+            image.channels = frame->channels;
+            image.data = frame->data;
+
+            const std::vector<fd::FaceBox> faces = faceDetector->detect(image);
+            facesSeen += static_cast<int>(faces.size());
+            std::cout << "  faces: " << faces.size();
+            for (const fd::FaceBox& face : faces) {
+                std::cout << " (" << face.x << "," << face.y << " "
+                          << face.width << "x" << face.height << " score="
+                          << face.score << ")";
+            }
+            std::cout << '\n';
+        }
+#endif
 
         if (!outPath.empty() && received == 0) {
             if (savePpm(*frame, outPath)) {
@@ -529,5 +597,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "Captured " << received << " frame(s).\n";
+#ifdef OC_HAVE_FACE
+    if (faceDetector) {
+        std::cout << "Detected " << facesSeen << " face(s) in total.\n";
+    }
+#else
+    (void)facesSeen;
+#endif
     return 0;
 }

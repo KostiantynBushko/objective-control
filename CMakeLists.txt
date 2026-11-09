@@ -15,6 +15,7 @@ option(OBJECTIVE_CONTROL_ENABLE_GSTREAMER  "Enable GStreamer-based camera pipeli
 option(OBJECTIVE_CONTROL_BUILD_APPS        "Build example applications"                        ${PROJECT_IS_TOP_LEVEL})
 option(OBJECTIVE_CONTROL_BUILD_TESTS       "Build unit tests"                                  ${PROJECT_IS_TOP_LEVEL})
 option(OBJECTIVE_CONTROL_ENABLE_SANITIZERS "Build with Address/Undefined sanitizers (debug)"   OFF)
+option(OBJECTIVE_CONTROL_ENABLE_FACE       "Use the face-detection submodule"                    OFF)
 
 # ---------------------------------------------------------------------------
 # Load dependency discovery + compiler-warning helpers.
@@ -56,9 +57,35 @@ configure_file(
 )
 
 # ---------------------------------------------------------------------------
+# Face detection (optional submodule).
+#
+# The face-detection library lives in its own git repository and is consumed
+# as a submodule at third_party/face-detection. It is OFF by default so that
+# a clone made without "--recurse-submodules" still configures and builds.
+# ---------------------------------------------------------------------------
+set(OBJECTIVE_CONTROL_HAVE_FACE FALSE)
+
+if(OBJECTIVE_CONTROL_ENABLE_FACE)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/face-detection/CMakeLists.txt)
+        add_subdirectory(third_party/face-detection)
+        set(OBJECTIVE_CONTROL_HAVE_FACE TRUE)
+    else()
+        message(WARNING
+            "OBJECTIVE_CONTROL_ENABLE_FACE is ON but the face-detection "
+            "submodule is not checked out. Run:\n"
+            "  git submodule update --init --recursive")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # Subdirectories.
 # ---------------------------------------------------------------------------
 add_subdirectory(src)
+
+if(OBJECTIVE_CONTROL_HAVE_FACE)
+    target_link_libraries(objective_control PUBLIC face-detection::face_detection)
+    target_compile_definitions(objective_control PUBLIC OC_HAVE_FACE=1)
+endif()
 
 if(OBJECTIVE_CONTROL_BUILD_APPS)
     add_subdirectory(apps)
