@@ -1,0 +1,3 @@
+[submodule "third_party/face-detection"]
+	path = third_party/face-detection
+	url = /home/kbush/milproj/face-detection.git

@@ -296,7 +296,7 @@ CMakePresets.json                             Debug / release / asan presets
 
 | Project | Description |
 |---------|-------------|
-| [`third_party/face-detection`](third_party/face-detection) | Standalone face detection and recognition library (OpenCV YuNet + SFace, C++20). It is its own git repository, currently living in-tree; it will be promoted to a git submodule once it has a remote of its own. |
+| [`third_party/face-detection`](third_party/face-detection) | Standalone face detection and recognition library (OpenCV YuNet + SFace, C++20). Consumed as a git submodule — see [Submodules](#submodules). |
 
 `face-detection`'s `fd::Image` has exactly the same layout as `oc::Frame`
 (dense, row-major BGR or grayscale), so a captured frame can be handed to the
@@ -309,3 +309,26 @@ frame.height  = captured->height;
 frame.channels = captured->channels;
 frame.data    = captured->data;   // no copy
 ```
+
+## Submodules
+
+This repository uses a git submodule:
+
+| Submodule | Path | Purpose |
+|-----------|------|---------|
+| `face-detection` | `third_party/face-detection` | Face detection and recognition library |
+
+Clone with the submodules:
+
+```sh
+git clone --recurse-submodules <url>
+```
+
+For an existing clone:
+
+```sh
+git submodule update --init --recursive
+```
+
+The submodule's model weights are not committed; fetch them once with
+`third_party/face-detection/models/fetch.sh`.

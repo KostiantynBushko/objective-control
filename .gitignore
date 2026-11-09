@@ -14,12 +14,6 @@ compile_commands.json
 clip.mp4
 frame.ppm
 
-# Third-party / in-tree libraries that are their own git repositories.
-# face-detection is a standalone repository living in-tree until it has a
-# remote of its own; it will then be promoted to a real git submodule and
-# this entry removed in favour of a .gitmodules entry.
-third_party/face-detection/
-
 # Editor / OS cruft
 .vscode/
 .idea/
