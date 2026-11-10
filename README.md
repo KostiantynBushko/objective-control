@@ -18,6 +18,9 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
   streaming, and live preview, plus a built-in `--help`.
 - Optional dependencies degrade gracefully (e.g. no OpenCV → still builds with
   the built-in backends).
+- A desktop editor for the face database (`tools/face-db-editor`): review the
+  enrolled people, correct their names and metadata, and look at the picture
+  of a face.
 - CMake presets (debug / release / asan) and strict compiler warnings.
 
 ## Requirements
@@ -566,6 +569,36 @@ several machines at once.
 of `0.4` is the usual "same person" threshold for SFace; lower it to be
 stricter, raise it if legitimate matches are being rejected.
 
+#### Reviewing the enrolments
+
+The properties of a person are written once, when the person is enrolled,
+and are rarely right afterwards: a name gets misspelled, a piece of
+metadata turns out to be missing, the wrong picture was captured. The
+**face database editor** opens the same table and lets them be corrected.
+
+It is a small Python application with a window, in
+[`tools/face-db-editor`](tools/face-db-editor):
+
+```sh
+pip install -r tools/face-db-editor/requirements.txt
+
+python3 tools/face-db-editor/face_db_editor.py \
+    --dsn='postgres://user@localhost/objective_control'
+```
+
+The connection string is taken from `--dsn`, else from `$FACE_DB_URL`, else
+from `$DATABASE_URL` -- the same order the app uses. It needs a display.
+
+The editor lists the enrolled people, shows the samples of the selected one
+with the picture of the face that was captured at the time, and stores a
+corrected name or metadata again. The picture can be saved to a file. The
+changes are written to every sample of the person, exactly as the app
+writes them when it enrols somebody, so the app picks them up the next time
+it loads the store.
+
+See [`tools/face-db-editor/README.md`](tools/face-db-editor/README.md) for
+the details.
+
 #### Locating the model files
 
 The model weights are looked up **relative to the current working directory**,
@@ -640,6 +673,7 @@ src/backends/rtsp_ffmpeg.cpp                  Low-latency RTSP backend (FFmpeg)
 apps/camera_demo.cpp                          Example CLI application
 apps/mjpeg_stream.hpp                         Minimal MJPEG-over-HTTP server
 scripts/setup-db.sh                           Creates the PostgreSQL role and database
+tools/face-db-editor/                         Desktop editor for the face database
 tests/camera_test.cpp                         Smoke test (no external test deps)
 cmake/                                        Dependency + warning helpers
 CMakePresets.json                             Debug / release / asan presets

@@ -1,0 +1,10 @@
+# The PostgreSQL driver. The editor talks to the very same table the C++
+# library writes, so it needs the libpq bindings.
+psycopg[binary]>=3.1
+
+# The picture of a face is stored as a JPEG, and Tk can only show a PNG,
+# so the picture is converted before it can be previewed. Pillow does
+# that. ImageMagick ("magick" or "convert") is used instead when Pillow
+# is not installed; without either of them the picture can still be saved
+# to a file, it just cannot be previewed.
+Pillow>=9.0
