@@ -166,6 +166,8 @@ with status `0`. It needs no camera and works on its own.
 | `--face-db-remove=<id>` | *(none)* | remove every sample of a person and exit (no camera)  |
 | `--face-db-init`     | *(off)*   | create the database schema and exit (no camera)       |
 | `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
+| `--enroll-name=<name>` | *(none)* | name of the person being enrolled; shown on screen    |
+| `--enroll-metadata=<json>` | *(none)* | extra properties of the person, as a JSON document |
 | `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
 | `-h`, `--help`        | —         | print the option list and exit                         |
@@ -307,8 +309,9 @@ with status `0`. It needs no camera and works on its own.
 > `debug` to see what FFmpeg has to say about the stream.
 
 > Adding `--faces` (or `--recognize`) draws a box around every detected face.
-> A recognised person gets a green box labelled with their id, an unknown
-> face an amber box labelled `unknown`. The same overlay is drawn on the
+> A recognised person gets a green box labelled with their **name** -- or
+> with their id when no name was enrolled -- and an unknown face an amber
+> box labelled `unknown`. The same overlay is drawn on the
 > frames served by `--stream`, so the MJPEG page shows it too. Detection
 > costs roughly 25 ms per frame, which caps the preview at a lower frame
 > rate than the raw capture.
@@ -417,16 +420,34 @@ Face detection enabled (model: third_party/face-detection/models/face_detection_
 Face recognition enabled (model: third_party/face-detection/models/face_recognition_sface_2021dec.onnx).
 Loaded 1 enrolment(s) from faces.db.
 Frame 0: 1920x1080 (3 ch), 6220800 bytes, t=6454us.
-  faces: 2 (412,180 213x280 score=0.918774) -> person 42 (distance 0.0832154) (1244,201 226x296 score=0.909496) -> unknown (distance 0.571002)
+  faces: 2 (412,180 213x280 score=0.918774) -> Ada Lovelace (person 42, distance 0.0832154) (1244,201 226x296 score=0.909496) -> unknown (distance 0.571002)
 Captured 1 frame(s).
 Detected 2 face(s) in total.
 Recognised 1 face(s) against the database.
 ```
 
 `--enroll` requires `--face-db`, because an enrolment that is never written
-to the store is lost. The database stores **embeddings only, never
-photographs**, and uses the same file format as the submodule's own app, so
-both can share one `faces.db`.
+to the store is lost. The database uses the same file format as the
+submodule's own app, so both can share one `faces.db`.
+
+An enrolment holds the embedding of the face and the **properties** of the
+person it belongs to:
+
+| Property   | How it is set                          | What it is for                                  |
+|------------|----------------------------------------|-------------------------------------------------|
+| the name   | `--enroll-name=<name>`                 | shown on screen when the person is detected      |
+| the picture| automatically, from the enrolled frame  | recognising the person by eye later on           |
+| the metadata | `--enroll-metadata=<json>`           | anything else the application wants to remember  |
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --enroll=42 \
+    --enroll-name="Ada Lovelace" --enroll-metadata='{"role":"admin"}' \
+    --face-db=postgres://user@localhost/objective_control
+```
+
+The metadata has to be a JSON document; anything else is rejected before
+the camera is opened.
 
 ### Where the enrolments are stored
 
@@ -435,7 +456,7 @@ live:
 
 | Target                            | Backend                                    |
 |-----------------------------------|--------------------------------------------|
-| `faces.db`                        | a file, in the flat `FDB1` binary format    |
+| `faces.db`                        | a file, in the flat `FDB2` binary format    |
 | `postgres://user@host/database`   | a PostgreSQL table                          |
 
 A target that starts with `postgres://` or `postgresql://` is a PostgreSQL
@@ -456,9 +477,27 @@ CREATE TABLE face_enrollments (
     id          bigserial   PRIMARY KEY,
     person_id   integer     NOT NULL,
     embedding   real[]      NOT NULL,
+    user_name   text,
+    photo       bytea,
+    metadata    jsonb       NOT NULL DEFAULT '{}'::jsonb,
     enrolled_at timestamptz NOT NULL DEFAULT now()
 );
 ```
+
+The three optional columns hold the properties of the person: the name
+that is shown on screen (`user_name`), a picture of the face (`photo`) and
+an arbitrary JSON document (`metadata`). They are stored with **every**
+sample of a person, so the store can answer "who is this?" without a second
+lookup.
+
+The columns were added after the table was introduced, so a table that
+predates them is **migrated in place** when the app connects -- the rows
+that are already there keep their data. A table that the runtime user is
+not allowed to alter is used as it is, without the properties: the app
+opens the store anyway and prints a warning that names the columns that
+are missing, so that it is clear why the name of a person is not stored.
+`--face-db-init` reports the problem and exits with status `1`, because
+the schema was asked for explicitly.
 
 The table is created when the app connects, so a plain database is enough.
 The DDL is also in

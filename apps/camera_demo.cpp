@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cmath>
 #include <csignal>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <fstream>
@@ -13,9 +14,11 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
 #ifdef OC_HAVE_OPENCV
 #include <opencv2/highgui.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/videoio.hpp>
 #include "mjpeg_stream.hpp"
@@ -26,6 +29,7 @@
 #include "face-detection/face/detector.hpp"
 #include "face-detection/face/recognizer.hpp"
 #include "face-detection/face/store.hpp"
+#include "face-detection/json.hpp"
 #endif
 
 namespace {
@@ -104,7 +108,7 @@ bool isKnownOption(const std::string& name) {
         "faces",   "face-model", "face-score", "face-detect-width",
         "recognize", "enroll", "face-db", "face-recognition-model",
         "face-max-distance", "face-db-list", "face-db-remove",
-        "face-db-init",
+        "face-db-init", "enroll-name", "enroll-metadata",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -233,6 +237,12 @@ Options:
   --enroll=<id>          Enrol the most confident face of the first frame
                          that contains one, under this person id. Implies
                          --faces and requires --face-db.
+  --enroll-name=<name>   Name of the person being enrolled. It is stored
+                         with the sample and shown on screen when the
+                         person is recognised.
+  --enroll-metadata=<json>
+                         Extra properties of the person, as a JSON document
+                         (e.g. {"role":"admin"}). Stored as they are.
   --face-recognition-model=<path>
                          SFace model file used by --recognize/--enroll
                          (default: third_party/face-detection/models/
@@ -379,11 +389,78 @@ fd::Image toFaceImage(const cv::Mat& mat) {
     return image;
 }
 
+// The caption of one detected face.
+struct FaceLabel {
+    /// The text that is drawn next to the box.
+    std::string text;
+
+    /// True when the face belongs to an enrolled person. The box is
+    /// green for a known person and amber for an unknown one.
+    bool known = false;
+};
+
+#ifdef OC_HAVE_OPENCV
+// Encodes the detected face as a JPEG, so that the picture of the person
+// is stored with the enrolment. Returns an empty vector when the face
+// could not be encoded.
+std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
+                                      const fd::FaceBox& face) {
+    // A little padding around the box: the edges of a face carry
+    // information as well.
+    const int pad = std::max(face.width, face.height) / 4;
+    const int x = std::max(0, face.x - pad);
+    const int y = std::max(0, face.y - pad);
+    const int width = std::min(source.cols - x, face.width + 2 * pad);
+    const int height = std::min(source.rows - y, face.height + 2 * pad);
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+
+    const cv::Mat crop = source(cv::Rect(x, y, width, height));
+    std::vector<uchar> buffer;
+    if (!cv::imencode(".jpg", crop, buffer, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+        return {};
+    }
+    return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+}
+#endif
+
+#ifdef OC_HAVE_FACE
+// Tells the user when the store cannot keep the properties of a person.
+//
+// A PostgreSQL table that predates the columns and that the runtime user
+// is not allowed to alter is used as it is: the name, the picture and the
+// metadata of a person are then dropped on the way in, which is worth a
+// word on the screen.
+void warnAboutMissingProperties(const fd::FaceStore& store) {
+    const std::vector<std::string> missing = store.missingPropertyColumns();
+    if (missing.empty()) {
+        return;
+    }
+
+    std::cerr << "Warning: the face database cannot store ";
+    for (std::size_t i = 0; i < missing.size(); ++i) {
+        if (i != 0) {
+            std::cerr << ", ";
+        }
+        std::cerr << missing[i];
+    }
+    std::cerr << ". ";
+    if (missing.size() == 1) {
+        std::cerr << "This property is not kept.";
+    } else {
+        std::cerr << "These properties are not kept.";
+    }
+    std::cerr << " The table is probably missing the column(s), and the "
+                 "database user is not allowed to alter it.\n";
+}
+#endif
+
 // Draws a box and a caption for every detected face. A recognised person
 // gets a green box, an unknown face an amber one, so the overlay can be
 // read at a glance.
 void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
-                   const std::vector<std::string>& labels) {
+                   const std::vector<FaceLabel>& labels) {
     // Scale the stroke and the caption with the frame so the overlay stays
     // readable on both a 320x240 sub-stream and a 4K one.
     const int thickness = std::max(1, image.cols / 400);
@@ -392,9 +469,10 @@ void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
 
     for (std::size_t i = 0; i < faces.size(); ++i) {
         const fd::FaceBox& face = faces[i];
-        const std::string label =
-            (i < labels.size()) ? labels[i] : std::string();
-        const bool known = label.rfind("person ", 0) == 0;
+        const FaceLabel label =
+            (i < labels.size()) ? labels[i] : FaceLabel();
+        const std::string& text = label.text;
+        const bool known = label.known;
 
         const cv::Scalar color =
             known ? cv::Scalar(0, 220, 0) : cv::Scalar(0, 165, 255);
@@ -402,14 +480,14 @@ void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
                       cv::Rect(face.x, face.y, face.width, face.height),
                       color, thickness);
 
-        if (label.empty()) {
+        if (text.empty()) {
             continue;
         }
 
         // Caption above the box; flip it below when there is no room.
         int baseline = 0;
         const cv::Size textSize =
-            cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, fontScale,
+            cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale,
                             thickness, &baseline);
         int textY = face.y - 6;
         if (textY - textSize.height < 0) {
@@ -421,7 +499,7 @@ void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
                       cv::Rect(textX, textY - textSize.height - 4,
                                textSize.width + 8, textSize.height + 6),
                       color, cv::FILLED);
-        cv::putText(image, label, cv::Point(textX + 4, textY - 4),
+        cv::putText(image, text, cv::Point(textX + 4, textY - 4),
                     cv::FONT_HERSHEY_SIMPLEX, fontScale, cv::Scalar(0, 0, 0),
                     thickness, cv::LINE_AA);
     }
@@ -468,6 +546,8 @@ int main(int argc, char** argv) {
         std::atoi(arg(argc, argv, "face-detect-width", "960").c_str());
     const bool doRecognize = flag(argc, argv, "recognize");
     const std::string enrollStr = arg(argc, argv, "enroll", "");
+    const std::string enrollName = arg(argc, argv, "enroll-name", "");
+    const std::string enrollMetadata = arg(argc, argv, "enroll-metadata", "");
     const std::string faceDbPath = arg(argc, argv, "face-db", "");
     const bool faceDbList = flag(argc, argv, "face-db-list");
     const bool faceDbInit = flag(argc, argv, "face-db-init");
@@ -512,6 +592,17 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+
+#ifdef OC_HAVE_FACE
+    // The metadata is stored in a JSON column, so it has to be a JSON
+    // document. It is checked here, because the error of the server is a
+    // lot harder to make sense of.
+    if (!enrollMetadata.empty() && !fd::isValidJson(enrollMetadata)) {
+        std::cerr << "Invalid --enroll-metadata value '" << enrollMetadata
+                  << "': not a JSON document.\n";
+        return 2;
+    }
+#endif
 
     // --face-db-remove=<id> names the person to remove.
     int faceDbRemoveId = -1;
@@ -597,6 +688,7 @@ int main(int argc, char** argv) {
                       << "': " << error << '\n';
             return 1;
         }
+        warnAboutMissingProperties(*store);
 
         if (faceDbList) {
             std::vector<fd::PersonSummary> people;
@@ -610,7 +702,11 @@ int main(int argc, char** argv) {
             }
             for (const fd::PersonSummary& person : people) {
                 std::cout << "  person " << person.person_id << ": "
-                          << person.samples << " sample(s)\n";
+                          << person.samples << " sample(s)";
+                if (!person.user_name.empty()) {
+                    std::cout << " (" << person.user_name << ")";
+                }
+                std::cout << '\n';
             }
             return 0;
         }
@@ -627,9 +723,16 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        // --face-db-init: a PostgreSQL store created its schema when it
-        // opened; a file store gets an empty database file.
+        // --face-db-init: a PostgreSQL store creates its schema here; a
+        // file store gets an empty database file.
         if (fd::isPostgresTarget(faceDbTarget)) {
+            // The schema is prepared again, and this time every problem
+            // is reported: the user asked for it to be set up.
+            if (!store->prepareSchema(error)) {
+                std::cerr << "Could not prepare the face database schema: "
+                          << error << '\n';
+                return 1;
+            }
             std::cout << "The face database schema in " << faceDbTarget
                       << " is ready.\n";
         } else {
@@ -724,11 +827,15 @@ int main(int argc, char** argv) {
                 camera->close();
                 return 1;
             }
+            warnAboutMissingProperties(*faceStore);
 
             std::vector<fd::FaceEntry> entries;
             if (faceStore->load(entries, error)) {
                 for (const fd::FaceEntry& entry : entries) {
-                    faceDatabase.enroll(entry.person_id, entry.embedding);
+                    // The whole entry is added, so that the name, the
+                    // picture and the metadata of the person survive the
+                    // reload.
+                    faceDatabase.add(entry);
                 }
                 std::cout << "Loaded " << entries.size() << " enrolment(s) from "
                           << faceDbTarget << ".\n";
@@ -754,17 +861,24 @@ int main(int argc, char** argv) {
         const fd::Image faceImage = toFaceImage(image);
         const std::vector<fd::FaceBox> faces = faceDetector->detect(faceImage);
 
-        std::vector<std::string> labels;
+        std::vector<FaceLabel> labels;
         labels.reserve(faces.size());
         for (const fd::FaceBox& face : faces) {
-            std::string label = "unknown";
+            FaceLabel label;
+            label.text = "unknown";
             if (faceRecognizer) {
                 fd::Embedding embedding;
                 if (faceRecognizer->embed(faceImage, face, embedding)) {
                     const fd::FaceDatabase::Match match = faceDatabase.match(
                         embedding, static_cast<float>(maxDistance));
                     if (match.matched) {
-                        label = "person " + std::to_string(match.person_id);
+                        // The name of the person is shown when there is
+                        // one; the id is the fallback.
+                        label.known = true;
+                        label.text = match.user_name.empty()
+                                         ? "person " +
+                                               std::to_string(match.person_id)
+                                         : match.user_name;
                     }
                 }
             }
@@ -979,8 +1093,14 @@ int main(int argc, char** argv) {
                                        static_cast<float>(maxDistance));
                 if (match.matched) {
                     ++recognizedSeen;
-                    std::cout << " -> person " << match.person_id
-                              << " (distance " << match.distance << ")";
+                    if (match.user_name.empty()) {
+                        std::cout << " -> person " << match.person_id
+                                  << " (distance " << match.distance << ")";
+                    } else {
+                        std::cout << " -> " << match.user_name << " (person "
+                                  << match.person_id << ", distance "
+                                  << match.distance << ")";
+                    }
                 } else if (faceDatabase.empty()) {
                     std::cout << " -> unknown (database is empty)";
                 } else {
@@ -1000,13 +1120,61 @@ int main(int argc, char** argv) {
                     }
                 }
 
+                // The properties of the person: the name that is shown
+                // when the person is recognised, the picture of the face
+                // and the metadata.
+                fd::EnrolmentInfo info;
+                info.user_name = enrollName;
+                info.metadata = enrollMetadata;
+#ifdef OC_HAVE_OPENCV
+                {
+                    // The picture of the face is stored with the sample,
+                    // so that the person can be recognised by eye later on.
+                    cv::Mat view;
+                    if (toMat(*frame, view)) {
+                        info.photo = encodeFace(view, *best);
+                    }
+                }
+#endif
+
+                // A store that cannot keep the properties drops them on
+                // the way in, so the messages below have to say so.
+                const bool storeKeepsProperties =
+                    faceStore == nullptr ||
+                    faceStore->missingPropertyColumns().empty();
+                const auto noteDropped = [&](const char* what) {
+                    if (storeKeepsProperties) {
+                        return;
+                    }
+                    std::cout << " (not stored: the face database cannot "
+                                 "keep " << what << ")";
+                };
+
                 fd::FaceEntry entry;
                 if (faceDatabase.enroll(enrollId, image, *best, *faceRecognizer,
-                                        &entry)) {
+                                        info, &entry)) {
                     enrolled = true;
                     std::cout << "  Enrolled person " << enrollId << " ("
                               << faceDatabase.size()
                               << " sample(s) in the database).\n";
+                    if (!info.user_name.empty()) {
+                        std::cout << "  The name of the person is \""
+                                  << info.user_name << "\"";
+                        noteDropped("it");
+                        std::cout << ".\n";
+                    }
+                    if (!info.photo.empty()) {
+                        std::cout << "  The picture of the face is "
+                                  << info.photo.size() << " bytes";
+                        noteDropped("it");
+                        std::cout << ".\n";
+                    }
+                    if (!info.metadata.empty()) {
+                        std::cout << "  The metadata of the person is "
+                                  << info.metadata;
+                        noteDropped("it");
+                        std::cout << ".\n";
+                    }
 
                     // The store appends the new sample on its own, so
                     // enrolling one person never rewrites the samples of
