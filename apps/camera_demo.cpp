@@ -25,6 +25,7 @@
 #include "face-detection/face/database.hpp"
 #include "face-detection/face/detector.hpp"
 #include "face-detection/face/recognizer.hpp"
+#include "face-detection/face/store.hpp"
 #endif
 
 namespace {
@@ -88,7 +89,8 @@ std::string arg(int argc, char** argv, const std::string& name,
 // Options that are switches: they never take a value.
 bool isBooleanOption(const std::string& name) {
     return name == "preview" || name == "window-fullscreen" ||
-           name == "faces" || name == "recognize" || name == "help";
+           name == "faces" || name == "recognize" || name == "help" ||
+           name == "face-db-list" || name == "face-db-init";
 }
 
 // Every option the app understands. Anything else is a typo and is reported
@@ -98,9 +100,11 @@ bool isKnownOption(const std::string& name) {
         "mode",    "source", "width",       "height", "fps",
         "frames",  "seconds", "out",       "record", "stream",
         "preview", "window-size", "window-fullscreen", "help",
+        "transport",
         "faces",   "face-model", "face-score", "face-detect-width",
         "recognize", "enroll", "face-db", "face-recognition-model",
-        "face-max-distance",
+        "face-max-distance", "face-db-list", "face-db-remove",
+        "face-db-init",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -191,6 +195,9 @@ Options:
                          serves the newest frame the camera sent.
   --preview              Open a live preview window; press 'q' or Esc to quit.
                          Always shows the newest frame the camera sent
+  --transport=<proto>    RTSP transport: udp (default, lowest latency) or tcp.
+                         The backend falls back to TCP when the camera does
+                         not accept UDP.
   --window-size=<size>   Preview window size: native (default) or <width>x<height>
   --window-fullscreen    Make the preview window fullscreen
   --faces                Run face detection on each captured frame and
@@ -211,8 +218,18 @@ Options:
                          set and print the person id; with --preview or
                          --stream the person id is drawn next to the box
                          (implies --faces)
-  --face-db=<path>       Face database file. Loaded when it exists and
-                         written back when --enroll is used.
+  --face-db=<target>     Face database. Either a file path or a PostgreSQL
+                         connection string starting with postgres:// or
+                         postgresql://. Loaded when it exists and written
+                         back when --enroll is used. Defaults to the
+                         $FACE_DB_URL or $DATABASE_URL environment
+                         variable.
+  --face-db-list         List the enrolled people and exit. Needs
+                         --face-db; no camera is opened.
+  --face-db-remove=<id>  Remove every sample of a person and exit. Needs
+                         --face-db; no camera is opened.
+  --face-db-init         Create the database schema and exit. Needs
+                         --face-db; no camera is opened.
   --enroll=<id>          Enrol the most confident face of the first frame
                          that contains one, under this person id. Implies
                          --faces and requires --face-db.
@@ -266,6 +283,14 @@ Examples:
   # Enrol the person in front of the camera as person 42
   objective-control-app --mode=embedded --source=/dev/video0 --enroll=42 \
       --face-db=faces.db
+
+  # Enrol into PostgreSQL instead of a file
+  objective-control-app --mode=embedded --source=/dev/video0 --enroll=42 \
+      --face-db=postgres://user@localhost/objective_control
+
+  # List who is enrolled in the PostgreSQL database (no camera needed)
+  objective-control-app --face-db=postgres://user@localhost/objective_control \
+      --face-db-list
 
 Exit codes:
   0  success
@@ -444,11 +469,29 @@ int main(int argc, char** argv) {
     const bool doRecognize = flag(argc, argv, "recognize");
     const std::string enrollStr = arg(argc, argv, "enroll", "");
     const std::string faceDbPath = arg(argc, argv, "face-db", "");
+    const bool faceDbList = flag(argc, argv, "face-db-list");
+    const bool faceDbInit = flag(argc, argv, "face-db-init");
+    const std::string faceDbRemoveStr = arg(argc, argv, "face-db-remove", "");
     const std::string faceRecModel = arg(argc, argv, "face-recognition-model",
                                          "third_party/face-detection/models/"
                                          "face_recognition_sface_2021dec.onnx");
     const double maxDistance =
         std::atof(arg(argc, argv, "face-max-distance", "0.4").c_str());
+
+    // The face database lives either in a file or in a PostgreSQL table.
+    // The target says which: a path, or a postgres:// connection string.
+    // An environment variable provides the default, so that a deployment
+    // does not have to repeat it on every command line.
+    std::string faceDbTarget = faceDbPath;
+    if (faceDbTarget.empty()) {
+        const char* faceDbUrl = std::getenv("FACE_DB_URL");
+        const char* databaseUrl = std::getenv("DATABASE_URL");
+        if (faceDbUrl != nullptr && *faceDbUrl != '\0') {
+            faceDbTarget = faceDbUrl;
+        } else if (databaseUrl != nullptr && *databaseUrl != '\0') {
+            faceDbTarget = databaseUrl;
+        }
+    }
 
     // --enroll=<id> names the person to enrol. -1 means "not enrolling".
     int enrollId = -1;
@@ -463,9 +506,24 @@ int main(int argc, char** argv) {
                       << "' (expected a non-negative integer).\n";
             return 2;
         }
-        if (faceDbPath.empty()) {
-            std::cerr << "--enroll requires --face-db=<path> to store the "
+        if (faceDbTarget.empty()) {
+            std::cerr << "--enroll requires --face-db=<target> to store the "
                          "enrolment.\n";
+            return 2;
+        }
+    }
+
+    // --face-db-remove=<id> names the person to remove.
+    int faceDbRemoveId = -1;
+    if (!faceDbRemoveStr.empty()) {
+        try {
+            faceDbRemoveId = std::stoi(faceDbRemoveStr);
+        } catch (const std::exception&) {
+            faceDbRemoveId = -1;
+        }
+        if (faceDbRemoveId < 0) {
+            std::cerr << "Invalid --face-db-remove value '" << faceDbRemoveStr
+                      << "' (expected a non-negative integer).\n";
             return 2;
         }
     }
@@ -498,12 +556,99 @@ int main(int argc, char** argv) {
     }
     config.source = source;
 
+    // RTSP transport. Empty means "udp, fall back to tcp", which is what
+    // the backend does when the camera does not accept UDP.
+    const std::string transport = arg(argc, argv, "transport", "");
+    if (!transport.empty() && transport != "udp" && transport != "tcp") {
+        std::cerr << "Invalid --transport value '" << transport
+                  << "' (expected 'udp' or 'tcp').\n";
+        return 2;
+    }
+    config.transport = transport;
+
     // A preview and an MJPEG stream are live: the consumer is usually
     // slower than the camera (decoding, drawing, JPEG encoding all take
     // time), so the backend has to hand out the newest frame rather than
     // the oldest one it has buffered. A recording keeps every frame, so it
     // stays on the lossless path.
     config.live = preview || streamPort > 0;
+
+    // ---------------- Face database administration ----------------
+    // Listing, removing and initialising the database do not need a camera,
+    // so they are handled before one is opened.
+    const bool dbAdmin =
+        faceDbList || faceDbInit || faceDbRemoveId >= 0;
+    if (dbAdmin) {
+#ifdef OC_HAVE_FACE
+        if (faceDbTarget.empty()) {
+            std::cerr << "--face-db-list, --face-db-init and "
+                         "--face-db-remove need --face-db=<target>.\n";
+            return 2;
+        }
+
+        std::string error;
+        auto store = fd::makeFaceStore(faceDbTarget, error);
+        if (!store) {
+            std::cerr << error << '\n';
+            return 1;
+        }
+        if (!store->open(faceDbTarget, error)) {
+            std::cerr << "Could not open the face database '" << faceDbTarget
+                      << "': " << error << '\n';
+            return 1;
+        }
+
+        if (faceDbList) {
+            std::vector<fd::PersonSummary> people;
+            if (!store->list(people, error)) {
+                std::cerr << "Could not list the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            if (people.empty()) {
+                std::cout << "Nobody is enrolled in " << faceDbTarget << ".\n";
+            }
+            for (const fd::PersonSummary& person : people) {
+                std::cout << "  person " << person.person_id << ": "
+                          << person.samples << " sample(s)\n";
+            }
+            return 0;
+        }
+
+        if (faceDbRemoveId >= 0) {
+            const int removed = store->remove(faceDbRemoveId, error);
+            if (removed < 0) {
+                std::cerr << "Could not remove person " << faceDbRemoveId
+                          << ": " << error << '\n';
+                return 1;
+            }
+            std::cout << "Removed " << removed << " sample(s) of person "
+                      << faceDbRemoveId << ".\n";
+            return 0;
+        }
+
+        // --face-db-init: a PostgreSQL store created its schema when it
+        // opened; a file store gets an empty database file.
+        if (fd::isPostgresTarget(faceDbTarget)) {
+            std::cout << "The face database schema in " << faceDbTarget
+                      << " is ready.\n";
+        } else {
+            const std::vector<fd::FaceEntry> none;
+            if (!store->save(none, error)) {
+                std::cerr << "Could not create the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            std::cout << "Created the face database " << faceDbTarget
+                      << ".\n";
+        }
+        return 0;
+#else
+        std::cerr << "--face-db-list, --face-db-init and --face-db-remove "
+                     "require a build with OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
+        return 1;
+#endif
+    }
 
     auto camera = oc::Camera::create(config.kind);
     if (!camera) {
@@ -546,6 +691,7 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<fd::FaceRecognizer> faceRecognizer;
     fd::FaceDatabase faceDatabase;
+    std::unique_ptr<fd::FaceStore> faceStore;
     if (doRecognize || enrollId >= 0) {
         faceRecognizer = std::make_unique<fd::FaceRecognizer>();
         fd::FaceRecognizer::Options recOptions;
@@ -561,12 +707,35 @@ int main(int argc, char** argv) {
         std::cout << "Face recognition enabled (model: " << faceRecModel
                   << ").\n";
 
-        if (!faceDbPath.empty() && faceDatabase.load(faceDbPath)) {
-            std::cout << "Loaded " << faceDatabase.size() << " enrolment(s) from "
-                      << faceDbPath << ".\n";
-        } else if (doRecognize && !faceDbPath.empty()) {
-            std::cout << "No face database at '" << faceDbPath
-                      << "'; no one can be recognised yet.\n";
+        // The store holds the samples; the database keeps them in memory
+        // so that the matching does not have to hit the database for every
+        // frame.
+        if (!faceDbTarget.empty()) {
+            std::string error;
+            faceStore = fd::makeFaceStore(faceDbTarget, error);
+            if (!faceStore) {
+                std::cerr << error << '\n';
+                camera->close();
+                return 1;
+            }
+            if (!faceStore->open(faceDbTarget, error)) {
+                std::cerr << "Could not open the face database '"
+                          << faceDbTarget << "': " << error << '\n';
+                camera->close();
+                return 1;
+            }
+
+            std::vector<fd::FaceEntry> entries;
+            if (faceStore->load(entries, error)) {
+                for (const fd::FaceEntry& entry : entries) {
+                    faceDatabase.enroll(entry.person_id, entry.embedding);
+                }
+                std::cout << "Loaded " << entries.size() << " enrolment(s) from "
+                          << faceDbTarget << ".\n";
+            } else {
+                std::cout << "No enrolments in '" << faceDbTarget
+                          << "' yet (" << error << ").\n";
+            }
         }
     }
 #else
@@ -764,6 +933,7 @@ int main(int argc, char** argv) {
 #ifdef OC_HAVE_FACE
     int recognizedSeen = 0;
     bool enrolled = false;
+    bool enrollmentStored = true;
 #endif
     for (int attempts = 0; attempts < frameCount * 40; ++attempts) {
         auto frame = camera->grab();
@@ -829,11 +999,29 @@ int main(int argc, char** argv) {
                         best = &face;
                     }
                 }
-                if (faceDatabase.enroll(enrollId, image, *best, *faceRecognizer)) {
+
+                fd::FaceEntry entry;
+                if (faceDatabase.enroll(enrollId, image, *best, *faceRecognizer,
+                                        &entry)) {
                     enrolled = true;
                     std::cout << "  Enrolled person " << enrollId << " ("
                               << faceDatabase.size()
                               << " sample(s) in the database).\n";
+
+                    // The store appends the new sample on its own, so
+                    // enrolling one person never rewrites the samples of
+                    // the others.
+                    if (faceStore) {
+                        std::string error;
+                        if (!faceStore->add(entry, error)) {
+                            std::cerr << "  Could not store the enrolment in '"
+                                      << faceDbTarget << "': " << error << '\n';
+                            enrollmentStored = false;
+                        } else {
+                            std::cout << "  Stored the enrolment in "
+                                      << faceDbTarget << ".\n";
+                        }
+                    }
                 } else {
                     std::cerr << "  Could not compute the embedding for the "
                                  "enrolment.\n";
@@ -874,13 +1062,14 @@ int main(int argc, char** argv) {
             std::cerr << "No face was detected, so person " << enrollId
                       << " was not enrolled.\n";
             exitCode = 1;
-        } else if (!faceDatabase.save(faceDbPath)) {
-            std::cerr << "Could not write the face database to '"
-                      << faceDbPath << "'.\n";
+        } else if (!enrollmentStored) {
+            std::cerr << "Person " << enrollId
+                      << " was enrolled in memory but could not be stored in '"
+                      << faceDbTarget << "'.\n";
             exitCode = 1;
         } else {
-            std::cout << "Saved " << faceDatabase.size() << " enrolment(s) to "
-                      << faceDbPath << ".\n";
+            std::cout << "The enrolment of person " << enrollId
+                      << " is stored in " << faceDbTarget << ".\n";
         }
     }
 #else

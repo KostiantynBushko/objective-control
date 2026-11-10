@@ -35,6 +35,12 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
   ```
   Without them the RTSP path falls back to OpenCV's `VideoCapture`, which
   buffers frames and shows a live preview about 1.7 s behind the camera.
+- Optional: [PostgreSQL](https://www.postgresql.org/) client library
+  (libpq), for storing the enrolled faces in a database.
+  ```sh
+  sudo apt install libpq-dev
+  ```
+  Without it the enrolments still work, but they are kept in a file.
 - Optional: a display (for `--preview`).
 
 ## Build
@@ -155,7 +161,10 @@ with status `0`. It needs no camera and works on its own.
 | `--face-score=<f>`   | *(default)*| minimum detection confidence to report a face       |
 | `--face-detect-width=<px>` | *(default)* | width the detector runs at (0 = native)  |
 | `--recognize`        | *(off)*   | identify each detected face against the enrolled set  |
-| `--face-db=<path>`   | *(none)*  | face database file (load + save)                      |
+| `--face-db=<target>` | *(none)*  | face database: a file path or a `postgres://…` connection string (load + save) |
+| `--face-db-list`     | *(off)*   | list the enrolled people and exit (no camera)         |
+| `--face-db-remove=<id>` | *(none)* | remove every sample of a person and exit (no camera)  |
+| `--face-db-init`     | *(off)*   | create the database schema and exit (no camera)       |
 | `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
 | `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
@@ -415,9 +424,104 @@ Recognised 1 face(s) against the database.
 ```
 
 `--enroll` requires `--face-db`, because an enrolment that is never written
-to disk is lost. The database stores **embeddings only, never photographs**,
-and uses the same file format as the submodule's own app, so both can share
-one `faces.db`.
+to the store is lost. The database stores **embeddings only, never
+photographs**, and uses the same file format as the submodule's own app, so
+both can share one `faces.db`.
+
+### Where the enrolments are stored
+
+`--face-db` takes a **target**, and the target decides where the enrolments
+live:
+
+| Target                            | Backend                                    |
+|-----------------------------------|--------------------------------------------|
+| `faces.db`                        | a file, in the flat `FDB1` binary format    |
+| `postgres://user@host/database`   | a PostgreSQL table                          |
+
+A target that starts with `postgres://` or `postgresql://` is a PostgreSQL
+one; everything else is a file. When `--face-db` is not given, the target is
+taken from `$FACE_DB_URL` or `$DATABASE_URL`, so a deployment does not have
+to repeat it on every command line:
+
+```sh
+export DATABASE_URL='postgres://user:secret@localhost:5432/objective_control'
+```
+
+#### PostgreSQL
+
+The PostgreSQL store keeps one row per enrolled sample:
+
+```sql
+CREATE TABLE face_enrollments (
+    id          bigserial   PRIMARY KEY,
+    person_id   integer     NOT NULL,
+    embedding   real[]      NOT NULL,
+    enrolled_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
+The table is created when the app connects, so a plain database is enough.
+The DDL is also in
+[`third_party/face-detection/sql/schema.sql`](third_party/face-detection/sql/schema.sql)
+for deployments that prepare the schema separately. The connection uses
+libpq, so `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER` and `PGPASSWORD` apply
+whenever the connection string does not spell them out.
+
+The table name is the one in `PostgresFaceStore::Options::table`
+(`face_enrollments` by default). PostgreSQL truncates identifiers to 63
+bytes, so the store shortens the name of the index it derives from it
+before it is sent -- a name that the server shortens would no longer match
+the name the store is looking for.
+
+Set the database up with the helper script (it needs a PostgreSQL
+superuser):
+
+```sh
+# Creates the role and the database, then applies the schema
+scripts/setup-db.sh --db-name=objective_control --db-user=objective_control
+
+# ... or with an explicit superuser connection
+scripts/setup-db.sh --admin-dsn='host=127.0.0.1 user=postgres dbname=postgres'
+
+# ... or with a superuser URL
+scripts/setup-db.sh \
+    --admin-dsn='postgres://postgres:postgres@127.0.0.1:5432/postgres' \
+    --db-name=objective_control --db-user=objective_control \
+    --db-password=objective_control
+```
+
+Without `--admin-dsn` the script uses `sudo -u postgres psql`, which is
+the usual way on a Debian/Ubuntu machine. The script can be run again on
+an existing installation: the role and the database are only created when
+they are missing.
+
+The connection string the script prints is the one to hand to the
+application:
+
+```sh
+export DATABASE_URL='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
+```
+
+Enrol into PostgreSQL and list who is enrolled:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --enroll=42 \
+    --face-db=postgres://user@localhost/objective_control
+
+./build/debug/bin/objective-control-app \
+    --face-db=postgres://user@localhost/objective_control --face-db-list
+
+./build/debug/bin/objective-control-app \
+    --face-db=postgres://user@localhost/objective_control --face-db-remove=42
+```
+
+The three `--face-db-*` options work on a file too, and none of them opens a
+camera.
+
+Enrolling a person **appends** one row; the samples of the other people are
+left alone. That keeps the enrolment cheap and makes it safe to enrol from
+several machines at once.
 
 `--face-max-distance` is the cosine-distance cut-off for a match. The default
 of `0.4` is the usual "same person" threshold for SFace; lower it to be
@@ -484,6 +588,7 @@ relative defaults resolve on their own.
 | `OBJECTIVE_CONTROL_BUILD_TESTS`         | `ON`    | Build + register tests              |
 | `OBJECTIVE_CONTROL_ENABLE_SANITIZERS`   | `OFF`   | ASan/UBSan in debug builds          |
 | `OBJECTIVE_CONTROL_ENABLE_FACE`         | `OFF`   | Use the face-detection submodule    |
+| `OBJECTIVE_CONTROL_ENABLE_POSTGRESQL`   | `ON`    | Store the enrolled faces in PostgreSQL |
 
 ## Layout
 
@@ -495,6 +600,7 @@ src/backends/http_mjpeg.hpp                   Self-contained HTTP MJPEG/snapshot
 src/backends/rtsp_ffmpeg.cpp                  Low-latency RTSP backend (FFmpeg)
 apps/camera_demo.cpp                          Example CLI application
 apps/mjpeg_stream.hpp                         Minimal MJPEG-over-HTTP server
+scripts/setup-db.sh                           Creates the PostgreSQL role and database
 tests/camera_test.cpp                         Smoke test (no external test deps)
 cmake/                                        Dependency + warning helpers
 CMakePresets.json                             Debug / release / asan presets
