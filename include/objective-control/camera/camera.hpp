@@ -39,6 +39,14 @@ struct CameraConfig {
     int height = 1080;
     int fps = 30;
 
+    /// RTSP transport: "udp" (default), "tcp" or empty for the default.
+    ///
+    /// UDP gives the lowest latency -- a lost TCP segment holds the whole
+    /// stream back until it is retransmitted. TCP is more reliable on a
+    /// lossy network, and some cameras do not accept UDP at all, so the
+    /// backend falls back to TCP when the UDP session cannot be opened.
+    std::string transport;
+
     /// Live mode: hand out the newest frame instead of the oldest one the
     /// backend has buffered.
     ///

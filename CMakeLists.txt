@@ -11,6 +11,7 @@ project(objective-control
 # Build-time options (turn features on/off without editing this file).
 # ---------------------------------------------------------------------------
 option(OBJECTIVE_CONTROL_ENABLE_OPENCV     "Enable OpenCV-backed embedded/IP camera backends" ON)
+option(OBJECTIVE_CONTROL_ENABLE_FFMPEG     "Use FFmpeg for the low-latency RTSP backend"        ON)
 option(OBJECTIVE_CONTROL_ENABLE_GSTREAMER  "Enable GStreamer-based camera pipelines"          OFF)
 option(OBJECTIVE_CONTROL_BUILD_APPS        "Build example applications"                        ${PROJECT_IS_TOP_LEVEL})
 option(OBJECTIVE_CONTROL_BUILD_TESTS       "Build unit tests"                                  ${PROJECT_IS_TOP_LEVEL})

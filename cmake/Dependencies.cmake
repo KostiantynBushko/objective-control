@@ -43,6 +43,42 @@ if(OBJECTIVE_CONTROL_ENABLE_OPENCV)
 endif()
 
 # ---------------------------------------------------------------------------
+# FFmpeg — used by the RTSP backend to decode a network stream with the
+# low-latency settings a live preview needs (no packet buffering, no frame
+# reordering delay). Without it the RTSP path falls back to OpenCV's
+# VideoCapture, which buffers frames and shows the picture seconds late.
+# ---------------------------------------------------------------------------
+set(OC_HAVE_FFMPEG FALSE)
+set(OC_FFMPEG_TARGETS "")
+
+if(OBJECTIVE_CONTROL_ENABLE_FFMPEG)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(FFmpeg IMPORTED_TARGET QUIET
+            libavformat libavcodec libavutil libswscale)
+        if(FFmpeg_FOUND)
+            set(OC_HAVE_FFMPEG TRUE)
+            set(OC_FFMPEG_TARGETS PkgConfig::FFmpeg)
+            execute_process(
+                COMMAND ${PKG_CONFIG_EXECUTABLE} --modversion libavformat
+                OUTPUT_VARIABLE FFMPEG_VERSION
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            message(STATUS "FFmpeg ${FFMPEG_VERSION} found (pkg-config)")
+        endif()
+    endif()
+
+    if(NOT OC_HAVE_FFMPEG)
+        message(WARNING
+            "FFmpeg not found. The RTSP backend falls back to OpenCV's "
+            "VideoCapture, which shows a live preview with a delay of "
+            "seconds. Install e.g. 'sudo apt install libavformat-dev "
+            "libavcodec-dev libavutil-dev libswscale-dev' for the "
+            "low-latency backend.")
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # GStreamer — optional alternative backend for advanced pipelines.
 # ---------------------------------------------------------------------------
 set(OC_HAVE_GSTREAMER FALSE)

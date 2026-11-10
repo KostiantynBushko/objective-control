@@ -21,9 +21,24 @@ if(OC_HAVE_OPENCV)
     target_compile_definitions(objective_control PUBLIC OC_HAVE_OPENCV=1)
     target_sources(objective_control PRIVATE
         backends/embedded_camera.cpp
-        backends/ip_camera.cpp
     )
     target_link_libraries(objective_control PUBLIC ${OC_OPENCV_TARGETS})
+endif()
+
+# FFmpeg-backed RTSP backend: low-latency decoding of a network stream.
+# Without it the RTSP path falls back to OpenCV's VideoCapture, which
+# buffers frames and shows a live preview seconds behind the camera.
+if(OC_HAVE_FFMPEG)
+    target_compile_definitions(objective_control PUBLIC OC_HAVE_FFMPEG=1)
+    target_sources(objective_control PRIVATE
+        backends/rtsp_ffmpeg.cpp
+    )
+    target_link_libraries(objective_control PUBLIC ${OC_FFMPEG_TARGETS})
+endif()
+
+# The IP backend dispatches RTSP and HTTP; it needs at least one of the two.
+if(OC_HAVE_OPENCV OR OC_HAVE_FFMPEG)
+    target_sources(objective_control PRIVATE backends/ip_camera.cpp)
 endif()
 
 # GStreamer backend (future).

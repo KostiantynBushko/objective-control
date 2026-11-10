@@ -14,7 +14,7 @@ std::unique_ptr<Camera> Camera::create(CameraKind kind) {
             return nullptr;
 #endif
         case CameraKind::Ip:
-#ifdef OC_HAVE_OPENCV
+#if defined(OC_HAVE_OPENCV) || defined(OC_HAVE_FFMPEG)
             return detail::makeIpCamera();
 #else
             return nullptr;

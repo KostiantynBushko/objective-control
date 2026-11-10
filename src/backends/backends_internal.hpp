@@ -12,6 +12,9 @@ std::unique_ptr<Camera> makeSyntheticCamera();
 
 #ifdef OC_HAVE_OPENCV
 std::unique_ptr<Camera> makeEmbeddedCamera();
+#endif
+
+#if defined(OC_HAVE_OPENCV) || defined(OC_HAVE_FFMPEG)
 std::unique_ptr<Camera> makeIpCamera();
 #endif
 

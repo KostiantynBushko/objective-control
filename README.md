@@ -28,7 +28,14 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
   ```sh
   sudo apt install libopencv-dev
   ```
-- Optional: FFmpeg (for MP4/AVI recording), a display (for `--preview`).
+- [FFmpeg](https://ffmpeg.org/) development libraries (recommended; enables
+  the low-latency RTSP backend). On Debian/Ubuntu:
+  ```sh
+  sudo apt install libavformat-dev libavcodec-dev libavutil-dev libswscale-dev
+  ```
+  Without them the RTSP path falls back to OpenCV's `VideoCapture`, which
+  buffers frames and shows a live preview about 1.7 s behind the camera.
+- Optional: a display (for `--preview`).
 
 ## Build
 
@@ -108,7 +115,7 @@ Key types:
 | Type           | Members                                                                 |
 |----------------|-------------------------------------------------------------------------|
 | `CameraKind`   | `Null`, `Embedded`, `Ip`, `Synthetic`                                   |
-| `CameraConfig` | `kind`, `source`, `width` (1920), `height` (1080), `fps` (30)            |
+| `CameraConfig` | `kind`, `source`, `width` (1920), `height` (1080), `fps` (30), `transport`, `live` |
 | `Frame`        | `width`, `height`, `channels`, `timestamp_us`, `data` (BGR or gray)      |
 | `Camera`       | `open`, `close`, `isOpen`, `grab` (`std::optional<Frame>`), `create`     |
 
@@ -142,6 +149,7 @@ with status `0`. It needs no camera and works on its own.
 | `--preview`           | *(off)*   | live preview window (`q`/Esc to quit)                 |
 | `--window-size=<s>`   | `native`  | preview window size: `native` or `<width>x<height>`   |
 | `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
+| `--transport=<proto>` | `udp`     | RTSP transport: `udp` (lowest latency) or `tcp`       |
 | `--faces`            | *(off)*   | run face detection on each captured frame; drawn on the image in `--preview`/`--stream` |
 | `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
 | `--face-score=<f>`   | *(default)*| minimum detection confidence to report a face       |
@@ -270,6 +278,24 @@ with status `0`. It needs no camera and works on its own.
 > picture would then be several seconds behind. Frames that piled up are
 > dropped instead. A recording (`--record`) keeps every frame and is not
 > affected.
+>
+> The RTSP backend decodes with the settings `ffplay` uses for a live
+> preview (`-rtsp_transport udp -fflags nobuffer -flags low_delay`) and keeps
+> only the newest frame. Measured against a 1080p30 HEVC camera on a
+> wired LAN, the frame that reaches the screen is about **45 ms** old — the
+> same as `ffplay` with those flags. The OpenCV `VideoCapture` fallback
+> needs about **1.7 s**, because it buffers the decoded frames and hands
+> them out oldest first.
+>
+> `--transport=tcp` forces the TCP transport. UDP is the default because a
+> lost TCP segment holds the whole stream back until it is retransmitted;
+> the backend falls back to TCP on its own when the camera does not accept
+> UDP.
+>
+> FFmpeg's own diagnostics are suppressed by the library, because a camera
+> that sends a slightly broken stream makes it complain about every frame.
+> Set `OBJECTIVE_CONTROL_FFMPEG_LOG` to `error`, `warning`, `info` or
+> `debug` to see what FFmpeg has to say about the stream.
 
 > Adding `--faces` (or `--recognize`) draws a box around every detected face.
 > A recognised person gets a green box labelled with their id, an unknown
@@ -293,7 +319,7 @@ with status `0`. It needs no camera and works on its own.
 | `Null`     | —                    | built-in                 |
 | `Synthetic`| —                    | built-in                 |
 | `Embedded` | `/dev/video0`, `0`   | OpenCV (V4L2)            |
-| `Ip`       | `rtsp://...`, `http://...` (MJPEG or snapshot) | RTSP: OpenCV/FFmpeg; HTTP: built-in client + `imgcodecs` |
+| `Ip`       | `rtsp://...`, `http://...` (MJPEG or snapshot) | RTSP: FFmpeg (low latency) or OpenCV; HTTP: built-in client + `imgcodecs` |
 
 ### Face detection and recognition
 
@@ -452,6 +478,7 @@ relative defaults resolve on their own.
 | Option                                  | Default | Purpose                             |
 |-----------------------------------------|---------|-------------------------------------|
 | `OBJECTIVE_CONTROL_ENABLE_OPENCV`       | `ON`    | Embedded/IP backends, record/stream |
+| `OBJECTIVE_CONTROL_ENABLE_FFMPEG`      | `ON`    | Low-latency RTSP backend            |
 | `OBJECTIVE_CONTROL_ENABLE_GSTREAMER`    | `OFF`   | GStreamer pipelines (future)        |
 | `OBJECTIVE_CONTROL_BUILD_APPS`          | `ON`    | Build the example app               |
 | `OBJECTIVE_CONTROL_BUILD_TESTS`         | `ON`    | Build + register tests              |
@@ -465,6 +492,7 @@ include/objective-control/camera/camera.hpp   Public API (Camera, Frame, ...)
 src/                                          Library implementation
 src/backends/                                 Per-backend implementations
 src/backends/http_mjpeg.hpp                   Self-contained HTTP MJPEG/snapshot client
+src/backends/rtsp_ffmpeg.cpp                  Low-latency RTSP backend (FFmpeg)
 apps/camera_demo.cpp                          Example CLI application
 apps/mjpeg_stream.hpp                         Minimal MJPEG-over-HTTP server
 tests/camera_test.cpp                         Smoke test (no external test deps)

@@ -1,6 +1,12 @@
 #include "backends/backends_internal.hpp"
 
+#ifdef OC_HAVE_OPENCV
 #include "backends/http_mjpeg.hpp"
+#endif
+
+#ifdef OC_HAVE_FFMPEG
+#include "backends/rtsp_ffmpeg.hpp"
+#endif
 
 #include <chrono>
 #include <cstring>
@@ -25,6 +31,10 @@ std::optional<Frame> matToFrame(const cv::Mat& image,
                              double timestamp_ms = 0.0);
 
 // RTSP (or any FFmpeg-decoded stream) backend using cv::VideoCapture.
+//
+// This is the fallback for builds without FFmpeg. It cannot be used for a
+// live preview: VideoCapture fills a queue with decoded frames and hands
+// them out oldest first, so the picture ends up seconds behind the camera.
 class RtspCamera final : public Camera {
 public:
     ~RtspCamera() override { close(); }
@@ -110,7 +120,6 @@ private:
     bool opened_ = false;
     bool live_ = false;
 };
-#endif
 
 // HTTP MJPEG / snapshot backend using the self-contained client.
 class HttpCamera final : public Camera {
@@ -149,9 +158,11 @@ private:
     HttpMjpegClient client_;
     bool opened_ = false;
 };
+#endif // OC_HAVE_OPENCV
 
-#ifdef OC_HAVE_OPENCV
-// Dispatches to RTSP (OpenCV) or HTTP (self-contained) based on the URL.
+#if defined(OC_HAVE_OPENCV) || defined(OC_HAVE_FFMPEG)
+// Dispatches to RTSP (FFmpeg or OpenCV) or HTTP (self-contained) based on
+// the URL.
 class IpCamera final : public Camera {
 public:
     ~IpCamera() override {
@@ -165,9 +176,22 @@ public:
             return false;
         }
         if (isRtsp(config.source)) {
+#ifdef OC_HAVE_FFMPEG
+            // The FFmpeg backend decodes with low-delay settings and hands
+            // out the newest frame, so a live preview is not seconds behind
+            // the camera.
+            impl_ = makeRtspCamera();
+#elif defined(OC_HAVE_OPENCV)
             impl_ = std::make_unique<RtspCamera>();
+#else
+            return false;
+#endif
         } else {
+#ifdef OC_HAVE_OPENCV
             impl_ = std::make_unique<HttpCamera>();
+#else
+            return false;
+#endif
         }
         return impl_->open(config);
     }
@@ -187,7 +211,9 @@ public:
 private:
     std::unique_ptr<Camera> impl_;
 };
+#endif // OC_HAVE_OPENCV || OC_HAVE_FFMPEG
 
+#ifdef OC_HAVE_OPENCV
 // Converts a BGR cv::Mat into a Frame (deep copy).
 std::optional<Frame> matToFrame(const cv::Mat& image, double timestamp_ms) {
     Frame frame;
@@ -209,7 +235,7 @@ std::optional<Frame> matToFrame(const cv::Mat& image, double timestamp_ms) {
 } // namespace
 
 std::unique_ptr<Camera> makeIpCamera() {
-#ifdef OC_HAVE_OPENCV
+#if defined(OC_HAVE_OPENCV) || defined(OC_HAVE_FFMPEG)
     return std::make_unique<IpCamera>();
 #else
     return nullptr;

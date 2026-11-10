@@ -64,6 +64,26 @@ int main() {
     }
     synth->close();
 
+    // The IP backend is available when the library was built with OpenCV or
+    // FFmpeg. It has to reject a source it cannot open instead of throwing
+    // or hanging.
+#if defined(OC_HAVE_OPENCV) || defined(OC_HAVE_FFMPEG)
+    auto ip = Camera::create(CameraKind::Ip);
+    check(static_cast<bool>(ip), "ip backend is created");
+
+    CameraConfig ipCfg;
+    ipCfg.kind = CameraKind::Ip;
+    ipCfg.source = "";
+    check(!ip->open(ipCfg), "ip backend rejects an empty source");
+
+    // A malformed RTSP URL must fail as well, and it must do so quickly.
+    ipCfg.source = "rtsp://";
+    ipCfg.transport = "udp";
+    check(!ip->open(ipCfg), "ip backend rejects a malformed RTSP URL");
+    ip->close();
+    check(!ip->isOpen(), "ip backend reports closed after close");
+#endif
+
     // Version header is populated by CMake at configure time.
     const std::string version = OC_VERSION_STRING;
     check(!version.empty() && version.front() >= '0' && version.front() <= '9',
