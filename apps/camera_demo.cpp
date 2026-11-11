@@ -10,8 +10,10 @@
 #include <cstdlib>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -94,7 +96,8 @@ std::string arg(int argc, char** argv, const std::string& name,
 bool isBooleanOption(const std::string& name) {
     return name == "preview" || name == "window-fullscreen" ||
            name == "faces" || name == "recognize" || name == "help" ||
-           name == "face-db-list" || name == "face-db-init";
+           name == "face-db-list" || name == "face-db-init" ||
+           name == "auto-enroll";
 }
 
 // Every option the app understands. Anything else is a typo and is reported
@@ -107,8 +110,9 @@ bool isKnownOption(const std::string& name) {
         "transport",
         "faces",   "face-model", "face-score", "face-detect-width",
         "recognize", "enroll", "face-db", "face-recognition-model",
-        "face-max-distance", "face-db-list", "face-db-remove",
-        "face-db-init", "enroll-name", "enroll-metadata",
+        "face-max-distance", "face-same-distance", "face-db-list",
+        "face-db-remove", "face-db-init", "enroll-name", "enroll-metadata",
+        "auto-enroll",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -243,6 +247,12 @@ Options:
   --enroll-metadata=<json>
                          Extra properties of the person, as a JSON document
                          (e.g. {"role":"admin"}). Stored as they are.
+  --auto-enroll          Enrol every face that is not in the database yet.
+                         A new face is given an id of its own and stored, so
+                         that it is recognised from the next frame on; a face
+                         that is already in the database -- whether it has a
+                         name or not -- is left alone. Implies --faces and
+                         --recognize and requires --face-db.
   --face-recognition-model=<path>
                          SFace model file used by --recognize/--enroll
                          (default: third_party/face-detection/models/
@@ -250,6 +260,12 @@ Options:
   --face-max-distance=<f>
                          Largest cosine distance still counted as a match
                          (default: 0.4; lower is stricter)
+  --face-same-distance=<f>
+                         Distance above which a face is certainly somebody
+                         new. A face between --face-max-distance and this
+                         one is probably somebody who is enrolled already,
+                         so --auto-enroll leaves it alone instead of
+                         enrolling the same person again (default: 0.6)
   -h, --help             Show this help and exit
 
 Options take their value with '=' (e.g. --width=640).
@@ -301,6 +317,10 @@ Examples:
   # List who is enrolled in the PostgreSQL database (no camera needed)
   objective-control-app --face-db=postgres://user@localhost/objective_control \
       --face-db-list
+
+  # Watch the camera and enrol every new face that shows up
+  objective-control-app --mode=embedded --source=/dev/video0 --preview \
+      --auto-enroll --face-db=postgres://user@localhost/objective_control
 
 Exit codes:
   0  success
@@ -372,23 +392,9 @@ bool writeFrame(cv::VideoWriter& writer, const oc::Frame& frame) {
     writer.write(image);
     return true;
 }
+#endif // OC_HAVE_OPENCV
 
 #ifdef OC_HAVE_FACE
-// Copies a cv::Mat into the layout the face library expects. fd::Image owns
-// its pixels, so this is one copy per frame; both use the same dense BGR
-// layout, so no colour conversion is needed.
-fd::Image toFaceImage(const cv::Mat& mat) {
-    const cv::Mat src = mat.isContinuous() ? mat : mat.clone();
-    fd::Image image;
-    image.width = src.cols;
-    image.height = src.rows;
-    image.channels = src.channels();
-    const std::size_t bytes =
-        static_cast<std::size_t>(src.total()) * src.elemSize();
-    image.data.assign(src.ptr(), src.ptr() + bytes);
-    return image;
-}
-
 // The caption of one detected face.
 struct FaceLabel {
     /// The text that is drawn next to the box.
@@ -399,33 +405,6 @@ struct FaceLabel {
     bool known = false;
 };
 
-#ifdef OC_HAVE_OPENCV
-// Encodes the detected face as a JPEG, so that the picture of the person
-// is stored with the enrolment. Returns an empty vector when the face
-// could not be encoded.
-std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
-                                      const fd::FaceBox& face) {
-    // A little padding around the box: the edges of a face carry
-    // information as well.
-    const int pad = std::max(face.width, face.height) / 4;
-    const int x = std::max(0, face.x - pad);
-    const int y = std::max(0, face.y - pad);
-    const int width = std::min(source.cols - x, face.width + 2 * pad);
-    const int height = std::min(source.rows - y, face.height + 2 * pad);
-    if (width <= 0 || height <= 0) {
-        return {};
-    }
-
-    const cv::Mat crop = source(cv::Rect(x, y, width, height));
-    std::vector<uchar> buffer;
-    if (!cv::imencode(".jpg", crop, buffer, {cv::IMWRITE_JPEG_QUALITY, 85})) {
-        return {};
-    }
-    return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
-}
-#endif
-
-#ifdef OC_HAVE_FACE
 // Tells the user when the store cannot keep the properties of a person.
 //
 // A PostgreSQL table that predates the columns and that the runtime user
@@ -454,7 +433,79 @@ void warnAboutMissingProperties(const fd::FaceStore& store) {
     std::cerr << " The table is probably missing the column(s), and the "
                  "database user is not allowed to alter it.\n";
 }
-#endif
+
+// Hands out the ids of the people who are enrolled automatically.
+//
+// The id of a person is what tells two of them apart in the database, so
+// an id that is already in use must never be handed out a second time.
+// The ids that are taken are reserved here; the ones that are read back
+// from the store are added to them, so that a second instance of the
+// application does not pick an id that somebody else has taken in the
+// meantime.
+class PersonIdPool {
+public:
+    /// Marks an id as taken.
+    void reserve(int id) {
+        used_.insert(id);
+        if (id >= next_) {
+            next_ = id + 1;
+        }
+    }
+
+    /// Hands out the lowest id that is not taken yet.
+    int take() {
+        while (used_.count(next_) != 0) {
+            ++next_;
+        }
+        const int id = next_++;
+        used_.insert(id);
+        return id;
+    }
+
+private:
+    std::set<int> used_;
+    int next_ = 1;
+};
+
+#ifdef OC_HAVE_OPENCV
+// Copies a cv::Mat into the layout the face library expects. fd::Image owns
+// its pixels, so this is one copy per frame; both use the same dense BGR
+// layout, so no colour conversion is needed.
+fd::Image toFaceImage(const cv::Mat& mat) {
+    const cv::Mat src = mat.isContinuous() ? mat : mat.clone();
+    fd::Image image;
+    image.width = src.cols;
+    image.height = src.rows;
+    image.channels = src.channels();
+    const std::size_t bytes =
+        static_cast<std::size_t>(src.total()) * src.elemSize();
+    image.data.assign(src.ptr(), src.ptr() + bytes);
+    return image;
+}
+
+// Encodes the detected face as a JPEG, so that the picture of the person
+// is stored with the enrolment. Returns an empty vector when the face
+// could not be encoded.
+std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
+                                      const fd::FaceBox& face) {
+    // A little padding around the box: the edges of a face carry
+    // information as well.
+    const int pad = std::max(face.width, face.height) / 4;
+    const int x = std::max(0, face.x - pad);
+    const int y = std::max(0, face.y - pad);
+    const int width = std::min(source.cols - x, face.width + 2 * pad);
+    const int height = std::min(source.rows - y, face.height + 2 * pad);
+    if (width <= 0 || height <= 0) {
+        return {};
+    }
+
+    const cv::Mat crop = source(cv::Rect(x, y, width, height));
+    std::vector<uchar> buffer;
+    if (!cv::imencode(".jpg", crop, buffer, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+        return {};
+    }
+    return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+}
 
 // Draws a box and a caption for every detected face. A recognised person
 // gets a green box, an unknown face an amber one, so the overlay can be
@@ -504,8 +555,8 @@ void annotateFaces(cv::Mat& image, const std::vector<fd::FaceBox>& faces,
                     thickness, cv::LINE_AA);
     }
 }
-#endif
-#endif
+#endif // OC_HAVE_OPENCV
+#endif // OC_HAVE_FACE
 
 } // namespace
 
@@ -545,6 +596,7 @@ int main(int argc, char** argv) {
     const int faceDetectWidth =
         std::atoi(arg(argc, argv, "face-detect-width", "960").c_str());
     const bool doRecognize = flag(argc, argv, "recognize");
+    const bool autoEnroll = flag(argc, argv, "auto-enroll");
     const std::string enrollStr = arg(argc, argv, "enroll", "");
     const std::string enrollName = arg(argc, argv, "enroll-name", "");
     const std::string enrollMetadata = arg(argc, argv, "enroll-metadata", "");
@@ -557,6 +609,20 @@ int main(int argc, char** argv) {
                                          "face_recognition_sface_2021dec.onnx");
     const double maxDistance =
         std::atof(arg(argc, argv, "face-max-distance", "0.4").c_str());
+
+    // The distance above which a face is certainly somebody new. Between
+    // --face-max-distance and this one, a face is very likely somebody who
+    // is enrolled already -- the camera sees a face differently every time
+    // (another pose, another distance, a little less light) -- and it is
+    // not enrolled a second time.
+    double sameDistance =
+        std::atof(arg(argc, argv, "face-same-distance", "0.6").c_str());
+    if (sameDistance <= maxDistance) {
+        std::cerr << "Ignoring --face-same-distance=" << sameDistance
+                  << ": it has to be larger than --face-max-distance ("
+                  << maxDistance << ").\n";
+        sameDistance = maxDistance;
+    }
 
     // The face database lives either in a file or in a PostgreSQL table.
     // The target says which: a path, or a postgres:// connection string.
@@ -589,6 +655,24 @@ int main(int argc, char** argv) {
         if (faceDbTarget.empty()) {
             std::cerr << "--enroll requires --face-db=<target> to store the "
                          "enrolment.\n";
+            return 2;
+        }
+    }
+
+    // --auto-enroll enrols the faces that are not in the database yet. It
+    // needs a place to put them, and it cannot be combined with --enroll:
+    // one of the two names the person to enrol, the other enrols whoever
+    // shows up.
+    if (autoEnroll) {
+        if (faceDbTarget.empty()) {
+            std::cerr << "--auto-enroll requires --face-db=<target> to store "
+                         "the faces it enrols.\n";
+            return 2;
+        }
+        if (enrollId >= 0) {
+            std::cerr << "--auto-enroll and --enroll cannot be used together: "
+                         "--enroll names the person to enrol, --auto-enroll "
+                         "enrols every face that is not in the database yet.\n";
             return 2;
         }
     }
@@ -771,8 +855,10 @@ int main(int argc, char** argv) {
 
     // ---------------- Face detection / recognition (optional submodule) ----------------
 #ifdef OC_HAVE_FACE
-    // --recognize and --enroll both need the detector, so they imply --faces.
-    const bool runFaces = detectFaces || doRecognize || enrollId >= 0;
+    // --recognize, --enroll and --auto-enroll all need the detector, so
+    // they imply --faces.
+    const bool runFaces =
+        detectFaces || doRecognize || enrollId >= 0 || autoEnroll;
 
     std::unique_ptr<fd::FaceDetector> faceDetector;
     if (runFaces) {
@@ -795,7 +881,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<fd::FaceRecognizer> faceRecognizer;
     fd::FaceDatabase faceDatabase;
     std::unique_ptr<fd::FaceStore> faceStore;
-    if (doRecognize || enrollId >= 0) {
+    if (doRecognize || enrollId >= 0 || autoEnroll) {
         faceRecognizer = std::make_unique<fd::FaceRecognizer>();
         fd::FaceRecognizer::Options recOptions;
         recOptions.model_path = faceRecModel;
@@ -846,12 +932,173 @@ int main(int argc, char** argv) {
         }
     }
 #else
-    if (detectFaces || doRecognize || enrollId >= 0) {
-        std::cerr << "--faces/--recognize/--enroll require a build with "
-                     "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
+    if (detectFaces || doRecognize || enrollId >= 0 || autoEnroll) {
+        std::cerr << "--faces/--recognize/--enroll/--auto-enroll require a "
+                     "build with OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
         camera->close();
         return 1;
     }
+#endif
+
+#ifdef OC_HAVE_FACE
+    // The ids of the people who are already in the database. A person who
+    // is enrolled automatically gets an id of their own, and that id must
+    // not be one of these.
+    PersonIdPool personIds;
+    for (const fd::FaceEntry& entry : faceDatabase.entries()) {
+        personIds.reserve(entry.person_id);
+    }
+
+    // Hands out an id that is not in use yet.
+    //
+    // The ids are read back from the store before one is handed out, so
+    // that a second instance of the application does not pick an id that
+    // somebody else has taken in the meantime.
+    auto allocatePersonId = [&]() -> int {
+        if (faceStore) {
+            std::vector<fd::PersonSummary> people;
+            std::string error;
+            if (faceStore->list(people, error)) {
+                for (const fd::PersonSummary& person : people) {
+                    personIds.reserve(person.person_id);
+                }
+            }
+        }
+        return personIds.take();
+    };
+
+    // What was found out about one face of a frame.
+    struct FaceResult {
+        fd::FaceBox box;
+
+        /// True when the face is in the database.
+        bool known = false;
+
+        /// True when the face is not in the database, but is close enough
+        /// to one of its samples to be very likely the same person.
+        bool probable = false;
+
+        /// The person the face belongs to.
+        int person_id = -1;
+
+        /// The distance to the closest sample of that person.
+        float distance = 1.0f;
+
+        /// True when the embedding of the face could be computed.
+        bool embedded = false;
+
+        /// True when this run enrolled the face.
+        bool enrolled = false;
+
+        /// The name of the person, when the sample carries one.
+        std::string user_name;
+    };
+
+    // Detects the faces in a frame and works out who each of them is.
+    //
+    // A face that is not in the database yet is enrolled when --auto-enroll
+    // is on: it is given an id of its own and stored, so that it is
+    // recognised from the next frame on like anybody else. A face that is
+    // in the database already -- whether its person has a name or not --
+    // is left alone.
+    //
+    // @p pictureOf makes the picture of a face. It is empty when the build
+    // cannot make one.
+    auto analyseFaces =
+        [&](const fd::Image& image,
+            const std::function<std::vector<std::uint8_t>(const fd::FaceBox&)>&
+                pictureOf) -> std::vector<FaceResult> {
+        std::vector<FaceResult> results;
+        if (!faceDetector) {
+            return results;
+        }
+
+        const std::vector<fd::FaceBox> faces = faceDetector->detect(image);
+        results.reserve(faces.size());
+
+        for (const fd::FaceBox& face : faces) {
+            FaceResult result;
+            result.box = face;
+
+            if (!faceRecognizer) {
+                results.push_back(result);
+                continue;
+            }
+
+            fd::Embedding embedding;
+            if (!faceRecognizer->embed(image, face, embedding)) {
+                results.push_back(result);
+                continue;
+            }
+            result.embedded = true;
+
+            const fd::FaceDatabase::Match match = faceDatabase.match(
+                embedding, static_cast<float>(maxDistance));
+            result.distance = match.distance;
+
+            if (match.matched) {
+                // The face is in the database already. Nothing is stored
+                // for it, whatever its person is called.
+                result.known = true;
+                result.person_id = match.person_id;
+                result.user_name = match.user_name;
+                results.push_back(result);
+                continue;
+            }
+
+            // The face is not in the database -- but it is close enough
+            // to one of its samples to be very likely the same person. A
+            // second enrolment of somebody who is enrolled already would
+            // fill the database with copies of them, so such a face is
+            // reported and left alone.
+            if (autoEnroll && faceStore && match.person_id >= 0 &&
+                match.distance <= sameDistance) {
+                result.probable = true;
+                result.person_id = match.person_id;
+                result.user_name = match.user_name;
+                results.push_back(result);
+                continue;
+            }
+
+            // The face is not in the database.
+            if (autoEnroll && faceStore) {
+                // The properties of the new person: the name is left empty
+                // on purpose, so that it can be filled in later with the
+                // face database editor. The metadata says where the person
+                // came from.
+                fd::EnrolmentInfo info;
+                info.metadata = "{\"auto_enrolled\": true}";
+                if (pictureOf) {
+                    info.photo = pictureOf(face);
+                }
+
+                const int personId = allocatePersonId();
+                fd::FaceEntry entry;
+                if (faceDatabase.enroll(personId, embedding, info, &entry)) {
+                    std::string error;
+                    if (faceStore->add(entry, error)) {
+                        result.known = true;
+                        result.person_id = personId;
+                        result.enrolled = true;
+                        result.distance = 0.0f;
+                        std::cout << "  Enrolled a new face as person "
+                                  << personId << ".\n";
+                    } else {
+                        // The face is not in the database after all, so it
+                        // is taken out of it again: it is enrolled by the
+                        // next frame that shows it.
+                        faceDatabase.remove(personId);
+                        std::cerr << "  Could not store the new person "
+                                  << personId << " in '" << faceDbTarget
+                                  << "': " << error << '\n';
+                    }
+                }
+            }
+
+            results.push_back(result);
+        }
+        return results;
+    };
 #endif
 
 #if defined(OC_HAVE_FACE) && defined(OC_HAVE_OPENCV)
@@ -859,34 +1106,43 @@ int main(int argc, char** argv) {
     // the person id when the face is known. Returns the number of faces.
     auto annotateFrame = [&](cv::Mat& image) -> int {
         const fd::Image faceImage = toFaceImage(image);
-        const std::vector<fd::FaceBox> faces = faceDetector->detect(faceImage);
+        const std::vector<FaceResult> results = analyseFaces(
+            faceImage, [&](const fd::FaceBox& box) {
+                return encodeFace(image, box);
+            });
 
+        std::vector<fd::FaceBox> boxes;
         std::vector<FaceLabel> labels;
-        labels.reserve(faces.size());
-        for (const fd::FaceBox& face : faces) {
+        boxes.reserve(results.size());
+        labels.reserve(results.size());
+        for (const FaceResult& result : results) {
+            boxes.push_back(result.box);
+
             FaceLabel label;
-            label.text = "unknown";
-            if (faceRecognizer) {
-                fd::Embedding embedding;
-                if (faceRecognizer->embed(faceImage, face, embedding)) {
-                    const fd::FaceDatabase::Match match = faceDatabase.match(
-                        embedding, static_cast<float>(maxDistance));
-                    if (match.matched) {
-                        // The name of the person is shown when there is
-                        // one; the id is the fallback.
-                        label.known = true;
-                        label.text = match.user_name.empty()
-                                         ? "person " +
-                                               std::to_string(match.person_id)
-                                         : match.user_name;
-                    }
-                }
+            label.known = result.known;
+            if (result.known) {
+                // The name of the person is shown when there is one; the
+                // id is the fallback.
+                label.text = result.user_name.empty()
+                                 ? "person " + std::to_string(result.person_id)
+                                 : result.user_name;
+            } else if (result.probable) {
+                // Somebody who is enrolled already, most likely. The name
+                // carries a question mark and the box stays amber, because
+                // the match is not certain.
+                const std::string who =
+                    result.user_name.empty()
+                        ? "person " + std::to_string(result.person_id)
+                        : result.user_name;
+                label.text = who + "?";
+            } else {
+                label.text = "unknown";
             }
             labels.push_back(label);
         }
 
-        annotateFaces(image, faces, labels);
-        return static_cast<int>(faces.size());
+        annotateFaces(image, boxes, labels);
+        return static_cast<int>(boxes.size());
     };
 #endif
 
@@ -1046,6 +1302,8 @@ int main(int argc, char** argv) {
     int facesSeen = 0;
 #ifdef OC_HAVE_FACE
     int recognizedSeen = 0;
+    int probableSeen = 0;
+    int autoEnrolledSeen = 0;
     bool enrolled = false;
     bool enrollmentStored = true;
 #endif
@@ -1070,10 +1328,27 @@ int main(int argc, char** argv) {
             image.channels = frame->channels;
             image.data = frame->data;
 
-            const std::vector<fd::FaceBox> faces = faceDetector->detect(image);
-            facesSeen += static_cast<int>(faces.size());
-            std::cout << "  faces: " << faces.size();
-            for (const fd::FaceBox& face : faces) {
+            // The picture of the face is stored with an enrolment, when the
+            // build can make one.
+            std::function<std::vector<std::uint8_t>(const fd::FaceBox&)>
+                pictureOf;
+#ifdef OC_HAVE_OPENCV
+            pictureOf = [&](const fd::FaceBox& box) {
+                cv::Mat view;
+                if (!toMat(*frame, view)) {
+                    return std::vector<std::uint8_t>();
+                }
+                return encodeFace(view, box);
+            };
+#endif
+
+            const std::vector<FaceResult> results =
+                analyseFaces(image, pictureOf);
+
+            facesSeen += static_cast<int>(results.size());
+            std::cout << "  faces: " << results.size();
+            for (const FaceResult& result : results) {
+                const fd::FaceBox& face = result.box;
                 std::cout << " (" << face.x << "," << face.y << " "
                           << face.width << "x" << face.height << " score="
                           << face.score << ")";
@@ -1081,30 +1356,39 @@ int main(int argc, char** argv) {
                 if (!faceRecognizer) {
                     continue;
                 }
-
-                // Identify this face against the enrolled set.
-                fd::Embedding embedding;
-                if (!faceRecognizer->embed(image, face, embedding)) {
+                if (!result.embedded) {
                     std::cout << " -> embedding failed";
                     continue;
                 }
-                const fd::FaceDatabase::Match match =
-                    faceDatabase.match(embedding,
-                                       static_cast<float>(maxDistance));
-                if (match.matched) {
+                if (result.known) {
                     ++recognizedSeen;
-                    if (match.user_name.empty()) {
-                        std::cout << " -> person " << match.person_id
-                                  << " (distance " << match.distance << ")";
+                    if (result.enrolled) {
+                        ++autoEnrolledSeen;
+                    }
+                    if (result.user_name.empty()) {
+                        std::cout << " -> person " << result.person_id
+                                  << " (distance " << result.distance << ")";
                     } else {
-                        std::cout << " -> " << match.user_name << " (person "
-                                  << match.person_id << ", distance "
-                                  << match.distance << ")";
+                        std::cout << " -> " << result.user_name << " (person "
+                                  << result.person_id << ", distance "
+                                  << result.distance << ")";
+                    }
+                } else if (result.probable) {
+                    ++probableSeen;
+                    // Somebody who is enrolled already, most likely: the
+                    // face was not enrolled a second time.
+                    if (result.user_name.empty()) {
+                        std::cout << " -> probably person " << result.person_id
+                                  << " (distance " << result.distance << ")";
+                    } else {
+                        std::cout << " -> probably " << result.user_name
+                                  << " (person " << result.person_id
+                                  << ", distance " << result.distance << ")";
                     }
                 } else if (faceDatabase.empty()) {
                     std::cout << " -> unknown (database is empty)";
                 } else {
-                    std::cout << " -> unknown (distance " << match.distance
+                    std::cout << " -> unknown (distance " << result.distance
                               << ")";
                 }
             }
@@ -1112,87 +1396,93 @@ int main(int argc, char** argv) {
 
             // Enrolment takes the most confident face of the first frame
             // that contains one.
-            if (enrollId >= 0 && !enrolled && !faces.empty()) {
-                const fd::FaceBox* best = &faces.front();
-                for (const fd::FaceBox& face : faces) {
-                    if (face.score > best->score) {
-                        best = &face;
+            if (enrollId >= 0 && !enrolled) {
+                const FaceResult* best = nullptr;
+                for (const FaceResult& result : results) {
+                    if (best == nullptr ||
+                        result.box.score > best->box.score) {
+                        best = &result;
                     }
                 }
 
-                // The properties of the person: the name that is shown
-                // when the person is recognised, the picture of the face
-                // and the metadata.
-                fd::EnrolmentInfo info;
-                info.user_name = enrollName;
-                info.metadata = enrollMetadata;
+                if (best != nullptr) {
+                    const fd::FaceBox& box = best->box;
+
+                    // The properties of the person: the name that is shown
+                    // when the person is recognised, the picture of the face
+                    // and the metadata.
+                    fd::EnrolmentInfo info;
+                    info.user_name = enrollName;
+                    info.metadata = enrollMetadata;
 #ifdef OC_HAVE_OPENCV
-                {
-                    // The picture of the face is stored with the sample,
-                    // so that the person can be recognised by eye later on.
-                    cv::Mat view;
-                    if (toMat(*frame, view)) {
-                        info.photo = encodeFace(view, *best);
-                    }
-                }
-#endif
-
-                // A store that cannot keep the properties drops them on
-                // the way in, so the messages below have to say so.
-                const bool storeKeepsProperties =
-                    faceStore == nullptr ||
-                    faceStore->missingPropertyColumns().empty();
-                const auto noteDropped = [&](const char* what) {
-                    if (storeKeepsProperties) {
-                        return;
-                    }
-                    std::cout << " (not stored: the face database cannot "
-                                 "keep " << what << ")";
-                };
-
-                fd::FaceEntry entry;
-                if (faceDatabase.enroll(enrollId, image, *best, *faceRecognizer,
-                                        info, &entry)) {
-                    enrolled = true;
-                    std::cout << "  Enrolled person " << enrollId << " ("
-                              << faceDatabase.size()
-                              << " sample(s) in the database).\n";
-                    if (!info.user_name.empty()) {
-                        std::cout << "  The name of the person is \""
-                                  << info.user_name << "\"";
-                        noteDropped("it");
-                        std::cout << ".\n";
-                    }
-                    if (!info.photo.empty()) {
-                        std::cout << "  The picture of the face is "
-                                  << info.photo.size() << " bytes";
-                        noteDropped("it");
-                        std::cout << ".\n";
-                    }
-                    if (!info.metadata.empty()) {
-                        std::cout << "  The metadata of the person is "
-                                  << info.metadata;
-                        noteDropped("it");
-                        std::cout << ".\n";
-                    }
-
-                    // The store appends the new sample on its own, so
-                    // enrolling one person never rewrites the samples of
-                    // the others.
-                    if (faceStore) {
-                        std::string error;
-                        if (!faceStore->add(entry, error)) {
-                            std::cerr << "  Could not store the enrolment in '"
-                                      << faceDbTarget << "': " << error << '\n';
-                            enrollmentStored = false;
-                        } else {
-                            std::cout << "  Stored the enrolment in "
-                                      << faceDbTarget << ".\n";
+                    {
+                        // The picture of the face is stored with the sample,
+                        // so that the person can be recognised by eye later on.
+                        cv::Mat view;
+                        if (toMat(*frame, view)) {
+                            info.photo = encodeFace(view, box);
                         }
                     }
-                } else {
-                    std::cerr << "  Could not compute the embedding for the "
-                                 "enrolment.\n";
+#endif
+
+                    // A store that cannot keep the properties drops them on
+                    // the way in, so the messages below have to say so.
+                    const bool storeKeepsProperties =
+                        faceStore == nullptr ||
+                        faceStore->missingPropertyColumns().empty();
+                    const auto noteDropped = [&](const char* what) {
+                        if (storeKeepsProperties) {
+                            return;
+                        }
+                        std::cout << " (not stored: the face database cannot "
+                                     "keep " << what << ")";
+                    };
+
+                    fd::FaceEntry entry;
+                    if (faceDatabase.enroll(enrollId, image, box,
+                                            *faceRecognizer, info, &entry)) {
+                        enrolled = true;
+                        std::cout << "  Enrolled person " << enrollId << " ("
+                                  << faceDatabase.size()
+                                  << " sample(s) in the database).\n";
+                        if (!info.user_name.empty()) {
+                            std::cout << "  The name of the person is \""
+                                      << info.user_name << "\"";
+                            noteDropped("it");
+                            std::cout << ".\n";
+                        }
+                        if (!info.photo.empty()) {
+                            std::cout << "  The picture of the face is "
+                                      << info.photo.size() << " bytes";
+                            noteDropped("it");
+                            std::cout << ".\n";
+                        }
+                        if (!info.metadata.empty()) {
+                            std::cout << "  The metadata of the person is "
+                                      << info.metadata;
+                            noteDropped("it");
+                            std::cout << ".\n";
+                        }
+
+                        // The store appends the new sample on its own, so
+                        // enrolling one person never rewrites the samples of
+                        // the others.
+                        if (faceStore) {
+                            std::string error;
+                            if (!faceStore->add(entry, error)) {
+                                std::cerr
+                                    << "  Could not store the enrolment in '"
+                                    << faceDbTarget << "': " << error << '\n';
+                                enrollmentStored = false;
+                            } else {
+                                std::cout << "  Stored the enrolment in "
+                                          << faceDbTarget << ".\n";
+                            }
+                        }
+                    } else {
+                        std::cerr << "  Could not compute the embedding for "
+                                     "the enrolment.\n";
+                    }
                 }
             }
         }
@@ -1224,6 +1514,15 @@ int main(int argc, char** argv) {
     if (faceRecognizer) {
         std::cout << "Recognised " << recognizedSeen << " face(s) against the "
                   << "database.\n";
+    }
+    if (autoEnroll) {
+        std::cout << "Enrolled " << autoEnrolledSeen << " new face(s) in "
+                  << faceDbTarget << ".\n";
+    }
+    if (probableSeen > 0) {
+        std::cout << "Probably " << probableSeen
+                  << " face(s) belonged to somebody who is enrolled already; "
+                     "they were not enrolled again.\n";
     }
     if (enrollId >= 0) {
         if (!enrolled) {

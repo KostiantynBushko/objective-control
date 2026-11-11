@@ -21,6 +21,8 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
 - A desktop editor for the face database (`tools/face-db-editor`): review the
   enrolled people, correct their names and metadata, and look at the picture
   of a face.
+- Optional face detection and recognition (OpenCV YuNet + SFace): enrol the
+  people by hand, or let the camera enrol whoever shows up.
 - CMake presets (debug / release / asan) and strict compiler warnings.
 
 ## Requirements
@@ -171,8 +173,10 @@ with status `0`. It needs no camera and works on its own.
 | `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
 | `--enroll-name=<name>` | *(none)* | name of the person being enrolled; shown on screen    |
 | `--enroll-metadata=<json>` | *(none)* | extra properties of the person, as a JSON document |
+| `--auto-enroll`       | *(off)*   | enrol every face that is not in the database yet      |
 | `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
+| `--face-same-distance=<f>` | `0.6` | distance above which a face is certainly somebody new |
 | `-h`, `--help`        | —         | print the option list and exit                         |
 
 > Every option takes its value with `=` (`--width=640`, **not** `--width 640`).
@@ -452,6 +456,74 @@ person it belongs to:
 The metadata has to be a JSON document; anything else is rejected before
 the camera is opened.
 
+#### Automatic enrolment (`--auto-enroll`)
+
+`--enroll` has to be told which person is in front of the camera.
+`--auto-enroll` does not: it enrols **every face that is not in the database
+yet**, so a camera can be left running and the people who show up are
+registered by themselves.
+
+```sh
+./build/debug/bin/objective-control-app \
+    --mode=embedded --source=/dev/video0 --preview \
+    --auto-enroll --face-db=postgres://user@localhost/objective_control
+```
+
+It follows one rule:
+
+| The face ...                        | What happens                                    |
+|-------------------------------------|-------------------------------------------------|
+| is not in the database yet           | is enrolled under an id of its own and stored    |
+| is in the database, with a name      | nothing is stored; the person is recognised       |
+| is in the database, without a name   | nothing is stored; the person is recognised       |
+
+The last row is the point of the mode: a face that was enrolled automatically
+has no name, and it still counts as being in the database. The person is
+recognised from the next frame on, and is not enrolled a second time.
+
+The id of a new person is one that has not been used yet. The ids in
+the database are read back from the store before one is handed out, so that a
+second instance of the application does not pick an id that somebody else has
+taken in the meantime. The ids are handed out in increasing order and are
+never reused, so an id always means the same person -- an id that was
+deleted does not turn up again with somebody else behind it.
+
+A new person is **not** called `unknown`:
+
+- their id is the number the app shows on screen (`person 42`);
+- their name is left empty on purpose -- it is filled in later with the
+  [face database editor](#reviewing-the-enrolments);
+- their metadata says where they came from: `{"auto_enrolled": true}`;
+- the picture of the face is stored with the sample, like any other enrolment.
+
+```
+Frame 0: 1920x1080 (3 ch), 6220800 bytes, t=6454us.
+  Enrolled a new face as person 1.
+  faces: 1 (412,180 213x280 score=0.918774) -> person 1 (distance 0)
+Frame 1: 1920x1080 (3 ch), 6220800 bytes, t=71204us.
+  faces: 1 (412,180 213x280 score=0.918774) -> person 1 (distance 0.0832154)
+```
+
+The second frame shows the same person: the face is in the database now, so
+nothing is stored for it.
+
+`--auto-enroll` needs `--face-db`, because a face that is never written to
+the store is lost, and it cannot be combined with `--enroll`: one of the two
+names the person to enrol, the other enrols whoever shows up.
+
+> A face that is **further** than `--face-max-distance` away from every
+> sample is treated as a new person and is enrolled again. Lower the
+> threshold to be stricter, raise it when the same person is enrolled twice.
+>
+> A face that is *not* that far away -- between `--face-max-distance` and
+> `--face-same-distance` -- is very likely somebody who is enrolled already:
+> the camera sees a face differently every time (another pose, another
+> distance, a little less light), and enrolling such a face again would
+> fill the database with copies of the same people. It is reported as
+> `probably <name>` and is **not** enrolled again. Lower
+> `--face-same-distance` when new people are not registered any more, raise
+> it when they are.
+
 ### Where the enrolments are stored
 
 `--face-db` takes a **target**, and the target decides where the enrolments
@@ -568,6 +640,14 @@ several machines at once.
 `--face-max-distance` is the cosine-distance cut-off for a match. The default
 of `0.4` is the usual "same person" threshold for SFace; lower it to be
 stricter, raise it if legitimate matches are being rejected.
+
+That default assumes a face that fills a good part of the frame. A face
+that is only a few dozen pixels wide is blurry, and the embedding of such a
+face moves by 0.1 to 0.3 between two pictures of the same person -- more
+than the threshold itself. Two things help there: a camera that is closer
+to the subject, and `--face-detect-width=0`, which runs the detector at the
+resolution of the frame. The landmarks are then measured on the pixels
+themselves, and the embedding that is computed from them is steadier.
 
 #### Reviewing the enrolments
 
