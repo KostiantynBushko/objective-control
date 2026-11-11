@@ -815,7 +815,7 @@ real camera.
 The work is split into three phases. Each phase leaves the tree in a state
 that builds and that is tested.
 
-### Phase 1 -- the tracker
+### Phase 1 -- the tracker (done)
 
 The tracker moves into the library, where it can be tested without a
 camera, a model or a database:
