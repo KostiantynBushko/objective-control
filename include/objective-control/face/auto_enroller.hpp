@@ -41,6 +41,13 @@ struct FaceView {
 /// A candidate lives in memory only. It is thrown away when it times out,
 /// and it is turned into a person when it is confident enough.
 struct FaceCandidate {
+    /// The id of the candidate.
+    ///
+    /// It is handed out by the tracker and does not change while the
+    /// candidate is watched, so it is what the application uses to talk
+    /// about a candidate.
+    int id = -1;
+
     /// The views that were collected for this face, oldest first.
     std::vector<FaceView> views;
 
@@ -151,6 +158,7 @@ public:
             Duplicate,        ///< The view was the same picture as another one.
             Inconsistent,     ///< The view was not the same person.
             TooManyCandidates, ///< Too many faces are being watched at once.
+            EnoughViews,      ///< The candidate holds as many views as it may.
             WindowOver,       ///< The collection window is over.
             TimedOut,         ///< The face was out of sight for too long.
         };
@@ -196,6 +204,17 @@ public:
     /// @p view is the face that was seen, @p now_us is the time it was seen
     /// at. The returned decision says what happened to it.
     Decision observe(const FaceView& view, std::uint64_t now_us);
+
+    /// The candidate whose closest view is the closest to @p embedding.
+    ///
+    /// A detection belongs to a candidate when it is within @p max_distance
+    /// of one of its views; the candidate whose closest view wins takes the
+    /// detection. This is the same rule that observe() follows, so that the
+    /// application can ask who owns a face before it offers it.
+    ///
+    /// Returns nullptr when no candidate is close enough.
+    [[nodiscard]] const FaceCandidate* closest(const fd::Embedding& embedding,
+                                                float max_distance) const;
 
     /// The candidates that are ready to be written to the store.
     ///

@@ -127,6 +127,19 @@ AutoEnroller::Decision AutoEnroller::observe(const FaceView& view,
         decision.candidate = owner->id;
         decision.data = &owner->candidate;
 
+        // A candidate holds at most as many views as it was asked for: the
+        // views it has are the resources of the person, and a candidate
+        // that is not stored (a store that could not be written) does not
+        // grow without a bound.
+        if (static_cast<int>(owner->candidate.views.size()) >=
+            options_.target_samples) {
+            decision.kind = Decision::Kind::ViewRejected;
+            decision.reason = Decision::Reason::EnoughViews;
+            decision.views = static_cast<int>(owner->candidate.views.size());
+            decision.confidence = owner->candidate.confidence();
+            return decision;
+        }
+
         // The duplicate gate: two views that are almost the same picture
         // are not two resources. Only one of them is kept.
         if (closest < options_.diversity) {
@@ -168,6 +181,7 @@ AutoEnroller::Decision AutoEnroller::observe(const FaceView& view,
 
     auto entry = std::make_unique<Entry>();
     entry->id = nextId_++;
+    entry->candidate.id = entry->id;
     entry->candidate.views.push_back(view);
     entry->candidate.first_seen_us = now_us;
     entry->candidate.last_seen_us = now_us;
@@ -182,6 +196,23 @@ AutoEnroller::Decision AutoEnroller::observe(const FaceView& view,
 
     candidates_.push_back(std::move(entry));
     return decision;
+}
+
+const FaceCandidate* AutoEnroller::closest(const fd::Embedding& embedding,
+                                            float max_distance) const {
+    const FaceCandidate* best = nullptr;
+    float closest = kNoDistance;
+    for (const std::unique_ptr<Entry>& entry : candidates_) {
+        const float distance = entry->candidate.closestDistance(embedding);
+        if (distance > max_distance) {
+            continue;
+        }
+        if (best == nullptr || distance < closest) {
+            best = &entry->candidate;
+            closest = distance;
+        }
+    }
+    return best;
 }
 
 std::vector<const FaceCandidate*> AutoEnroller::ready() const {

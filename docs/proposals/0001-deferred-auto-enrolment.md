@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed |
+| Status | Proposed -- phases 1 and 2 are implemented |
 | Date | 2026-11-11 |
 | Area | `--auto-enroll`, face enrolment pipeline |
 | Touches | `apps/camera_demo.cpp`, new `objective-control` face component, `face-detection` submodule (one additive API) |
@@ -424,6 +424,8 @@ metadata keep working. The two new fields are additive.
   --auto-enroll-attach   Add the collected views to a person that is
                          already in the database instead of creating a new
                          one
+  --auto-enroll-verbose  Print every view that is accepted and rejected,
+                         with its distance
 ```
 
 The existing options keep their meaning:
@@ -625,6 +627,10 @@ decision to use it belongs to the deployment, not to the application.
 When it is on, the flow of §5.6 changes: rule 1 (known person) starts a
 candidate as well, and the commit of that candidate attaches the views to
 the existing person instead of allocating a new id.
+
+The enrichment stops when the person holds as many samples as
+`--auto-enroll-samples`: without that limit, a person who stands in front
+of the camera would add three rows to the database every second.
 
 ---
 
@@ -830,14 +836,15 @@ The application is not touched in this phase: `--auto-enroll` behaves
 exactly as it does today. The tracker is a new class that nothing uses
 yet, which keeps the change small and easy to review.
 
-### Phase 2 -- the application
+### Phase 2 -- the application (done)
 
 The application starts using the tracker:
 
 * the new options of §5.9 (`--auto-enroll-mode`, `--auto-enroll-samples`,
   `--auto-enroll-window`, `--auto-enroll-timeout`,
   `--auto-enroll-consistency`, `--auto-enroll-diversity`,
-  `--auto-enroll-min-size`, `--auto-enroll-strict`),
+  `--auto-enroll-min-size`, `--auto-enroll-strict`, `--auto-enroll-attach`,
+  `--auto-enroll-verbose`),
 * the decision table of §5.6 in `analyseFaces()`,
 * the commit of §5.7: the person id is allocated when the candidate is
   committed, the views are written, and the samples are added to the
@@ -867,6 +874,25 @@ need a little more from its caller:
 | the face that is far from all the views of a candidate starts a candidate of its own | same: the *closest* candidate claims a detection, and the identity gate throws the view away when it does not fit | a face that is far from every view of every candidate starts a new one; a face that one candidate claims but that does not fit it is rejected |
 
 The gates, the defaults and the lifecycle are the ones of §5.4 and §5.5.
+
+### 14.2 What phase 2 changed against the proposal
+
+The implementation of phase 2 follows the proposal. There are a few places
+where it says something else, and every one of them is listed here.
+
+| The proposal | What was built | Why |
+|--------------|----------------|-----|
+| §5.4: the size gate is measured on the crop, "the picture that is stored" | it is measured on the cut-out *before* it is scaled up for the recognizer | the cut-out is scaled up to `--face-image-size` (320 by default), so a gate on the stored picture would never fire: every face would pass it |
+| §5.3: a candidate is dropped after `--auto-enroll-timeout` seconds | the tracker counts with the clock of the application, not with the timestamp of the frame | the timestamp of a frame is the capture time of the picture, and not every backend fills it in -- the HTTP snapshot backend does not |
+| §5.7: the views are written in one batch | they are written one by one, and what was written is taken back when the write fails | the batch write of §9.2 is phase 3 |
+| §7.1: `--auto-enroll-attach` adds the views to a person that is enrolled already | the views are only added while the person holds fewer than `--auto-enroll-samples` samples | without the limit, a person who stands in front of the camera would add three rows to the database every second |
+| §5.9: the options of the deferred mode | `--auto-enroll-verbose` was added | §11 asks for a switch that prints every accepted and rejected view with its distance; it is what one needs to tune the thresholds on a real camera |
+| §5.10: the tracker knows nothing but the embeddings | the tracker learned three things: the id of a candidate, the candidate that owns a face (`closest()`), and the limit on the number of views | the application has to know who owns a face before it offers it, so that the "probably somebody who is enrolled already" case of §5.6 is told apart from a face that nobody knows |
+| §5.8: the metadata holds the confidence | it holds it with three digits | a confidence of 0.2134 is noise; the number says how sure the application was |
+
+The decision table of §5.6 is implemented as it is written, the gates and the
+defaults are the ones of §5.4 and §5.5, and the lifecycle of §5.2 is the
+one of the tracker.
 
 ## Appendix A -- the code map of the current implementation
 

@@ -422,6 +422,82 @@ int main() {
         check(enroller.candidateCount() == 2, "the tracker watches two faces");
     }
 
+    // ------------------------------------------------------------------
+    // The candidate carries its id, so that the application can talk about
+    // it after another candidate was dropped.
+    // ------------------------------------------------------------------
+    {
+        AutoEnroller enroller(testOptions());
+
+        const Decision first = enroller.observe(viewAt(kSamePerson), 1000);
+        const Decision second = enroller.observe(viewAt(kOtherPerson), 2000);
+
+        check(first.candidate != second.candidate,
+              "every candidate has an id of its own");
+
+        const oc::FaceCandidate* candidate =
+            enroller.candidate(first.candidate);
+        check(candidate != nullptr, "the candidate can be looked up by its id");
+        if (candidate != nullptr) {
+            check(candidate->id == first.candidate,
+                  "the candidate knows its own id");
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // The application asks the tracker who owns a face before it offers
+    // it, so that the "probably somebody who is enrolled already" case is
+    // told apart from a face that nobody knows.
+    // ------------------------------------------------------------------
+    {
+        AutoEnroller enroller(testOptions());
+
+        const Decision first = enroller.observe(viewAt(kSamePerson), 1000);
+        const Decision second = enroller.observe(viewAt(kOtherPerson), 2000);
+
+        const oc::FaceCandidate* owner =
+            enroller.closest(embeddingAt(kSamePicture), 0.35f);
+        check(owner != nullptr, "the owner of a face is found");
+        if (owner != nullptr) {
+            check(owner->id == first.candidate,
+                  "the closest candidate owns the face");
+        }
+
+        const oc::FaceCandidate* other =
+            enroller.closest(embeddingAt(kOtherPerson), 0.35f);
+        check(other != nullptr, "the owner of the other face is found");
+        if (other != nullptr) {
+            check(other->id == second.candidate,
+                  "the second candidate owns the other face");
+        }
+
+        // 45 degrees is 0.29 away from both of them.
+        check(enroller.closest(embeddingAt(45.0), 0.001f) == nullptr,
+              "a face that is too far from every candidate has no owner");
+    }
+
+    // ------------------------------------------------------------------
+    // A candidate holds at most as many views as it was asked for: the
+    // views it has are the resources of the person, and a candidate that
+    // is not stored (a store that could not be written) does not grow
+    // without a bound.
+    // ------------------------------------------------------------------
+    {
+        AutoEnroller enroller(testOptions());
+
+        enroller.observe(viewAt(kSamePerson), 1000);
+        enroller.observe(viewAt(kAnotherPose), 2000);
+        const Decision third = enroller.observe(viewAt(kThirdPose), 3000);
+        check(third.ready, "the candidate is ready when the target is met");
+
+        const Decision fourth = enroller.observe(viewAt(30.0), 4000);
+        check(fourth.kind == Decision::Kind::ViewRejected,
+              "a view beyond the target is rejected");
+        check(fourth.reason == Decision::Reason::EnoughViews,
+              "a view beyond the target is rejected by the limit");
+        check(fourth.views == 3, "the candidate still holds three views");
+    }
+
     if (failures == 0) {
         std::cout << "auto_enroller_test: all checks passed.\n";
         return 0;
