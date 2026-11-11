@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Proposed -- phases 1 and 2 are implemented |
+| Status | Proposed -- phases 1, 2 and 3 are implemented |
 | Date | 2026-11-11 |
 | Area | `--auto-enroll`, face enrolment pipeline |
 | Touches | `apps/camera_demo.cpp`, new `objective-control` face component, `face-detection` submodule (one additive API) |
@@ -754,6 +754,8 @@ a file store:
   views that were collected;
 * a second run over the same frames does not create a second person.
 
+The three properties are checked by two tests -- see the end of §14.
+
 ### 10.3 Manual test
 
 * a person walks in front of the camera, stops, turns their head, leaves:
@@ -852,12 +854,29 @@ The application starts using the tracker:
 * the overlay of §5.12 (a face that is being tracked is drawn in blue,
   with the number of views it has) and the reports of §11.
 
-### Phase 3 -- the store, the tests and the documentation
+### Phase 3 -- the store, the tests and the documentation (done)
 
 * the batch write of §9.2 (`fd::FaceStore::addAll`), so that the views of
   one person land in one transaction,
 * the integration test of §10.2,
 * the README and the help text of the application.
+
+The batch write is an **additive** change of the `face-detection`
+submodule: `FaceStore::addAll()` appends several samples at once. The
+generic implementation loads the store, appends the samples and saves it
+again -- the file is rewritten once and not once per sample. The PostgreSQL
+store overrides it and writes the samples in one transaction, so that a
+person is either stored with all of its views or not at all.
+
+The tests are two of them:
+
+| Test | What it is |
+|------|------------|
+| `tests/auto_enroll_integration_test.cpp` | the tracker and a real file store together: the database is empty while the views are collected, the person is stored with every view that was collected, and a second run over the same faces does not create a second person |
+| `tests/auto_enroll_cli_test.cmake` | the application itself: a run with `--auto-enroll` against a synthetic camera and a file store. A test pattern has no faces in it, so nothing is stored and the database file is not even created |
+
+The second test needs the models of the submodule, which are downloaded
+rather than committed, so it is only registered when they are there.
 
 ### 14.1 What phase 1 changed against the sketch of §5.10
 
@@ -874,6 +893,15 @@ need a little more from its caller:
 | the face that is far from all the views of a candidate starts a candidate of its own | same: the *closest* candidate claims a detection, and the identity gate throws the view away when it does not fit | a face that is far from every view of every candidate starts a new one; a face that one candidate claims but that does not fit it is rejected |
 
 The gates, the defaults and the lifecycle are the ones of §5.4 and §5.5.
+
+### 14.3 What phase 3 changed against the proposal
+
+| The proposal | What was built | Why |
+|--------------|----------------|-----|
+| §9.2: the batch write is a change of the submodule | it is: `fd::FaceStore::addAll()` | the store is what holds the rows, so the API belongs there. The change is additive: the old `add()` keeps working, and a store that does not override `addAll()` still appends the samples one by one |
+| §9.2: "PostgreSQL -- overrides it, so that the samples of one person land in a single transaction" | it does, and so does the file store | the file store rewrites the whole file, so appending the samples in one go avoids a rewrite per view |
+| §5.8: the metadata of a person | it is built in one place | `oc::autoEnrolledMetadata()` and `oc::makeEnrolmentEntries()` build the samples of a person, so that the application and the tests cannot disagree about what a row looks like |
+| §10.2: "a run of the application against a synthetic camera" | it is, but there is no camera in the test that has a face in it | the models of the submodule are not committed and there is no face in a test pattern, so the run of the application can only show that nothing is written. The rest of the test -- the person that is stored with every view, and the second run that does not create a second person -- is covered by the integration test of the tracker and the store |
 
 ### 14.2 What phase 2 changed against the proposal
 

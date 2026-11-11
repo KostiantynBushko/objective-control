@@ -1451,19 +1451,6 @@ int main(int argc, char** argv) {
         }
     };
 
-    // The metadata of a person that was enrolled automatically.
-    //
-    // It is a property of the person and not of a single view, so it is
-    // stored with every view of that person -- which is what the face
-    // database editor expects.
-    auto autoEnrolledMetadata = [](int views, float confidence) {
-        std::ostringstream out;
-        out << "{\"auto_enrolled\": true, \"views\": " << views
-            << ", \"confidence\": " << std::setprecision(3) << confidence
-            << '}';
-        return out.str();
-    };
-
     // Writes the views of a candidate to the store.
     //
     // The person id is allocated here and not when the candidate was
@@ -1525,62 +1512,32 @@ int main(int argc, char** argv) {
             }
         }
 
-        // The samples of the person: one row per view.
-        const std::string metadata =
-            autoEnrolledMetadata(viewCount, confidence);
-        std::vector<fd::FaceEntry> entries;
-        entries.reserve(candidate.views.size());
-        for (const oc::FaceView& view : candidate.views) {
-            fd::FaceEntry entry;
-            entry.person_id = personId;
-            entry.embedding = view.embedding;
-            entry.info.metadata = metadata;
-            entry.info.photo = view.photo;
-            entries.push_back(entry);
-        }
+        // The samples of the person: one row per view, with the metadata
+        // of the person on every one of them.
+        const std::vector<fd::FaceEntry> entries =
+            oc::makeEnrolmentEntries(candidate, personId);
 
-        // The views are written one by one: the store has no batch write
-        // yet. A person is either stored with all of its views or not at
-        // all.
-        int written = 0;
-        bool failed = false;
-        std::string failure;
-        for (const fd::FaceEntry& entry : entries) {
-            std::string error;
-            if (!faceStore->add(entry, error)) {
-                failed = true;
-                failure = error;
-                break;
-            }
-            ++written;
-        }
-
-        if (failed) {
+        // The views are written in one go: the store writes the samples of
+        // one person in one transaction (PostgreSQL) or in one rewrite
+        // (the file), so the person is either stored with all of its views
+        // or not at all.
+        std::string error;
+        if (!faceStore->addAll(entries, error)) {
             if (writeFailures.insert(candidateId).second) {
                 std::cerr << "  Could not store person " << personId << " in '"
-                          << faceDbTarget << "': " << failure << '\n';
+                          << faceDbTarget << "': " << error << '\n';
             }
-            if (attaches) {
-                // The person was in the database already: the views that
-                // were written are kept, and the candidate is dropped --
-                // a retry would write them a second time.
-                for (std::size_t i = 0; i < static_cast<std::size_t>(written);
-                     ++i) {
-                    addToDatabase(entries[i]);
-                }
-                tracker.remove(candidateId);
-                candidateIds.erase(candidateId);
-                attachTargets.erase(candidateId);
-                ++discardedFaces;
-            } else if (written > 0) {
-                // The person is new: what was written is taken back, so
-                // that a person is either stored with all of its views or
-                // not at all.
-                std::string error;
-                faceStore->remove(personId, error);
+            if (!attaches) {
+                // The person is new: whatever reached the store is taken
+                // back, so that a person is either stored with all of its
+                // views or not at all. The person that was already in the
+                // database is left alone -- its own samples are not ours
+                // to remove.
+                std::string ignored;
+                faceStore->remove(personId, ignored);
             }
-            // The candidate stays in the tracker otherwise: the store is
-            // tried again with the next frame.
+            // The candidate stays in the tracker: the store is tried again
+            // with the next frame.
             return;
         }
         writeFailures.erase(candidateId);

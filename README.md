@@ -22,7 +22,9 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
   enrolled people, correct their names and metadata, and look at the picture
   of a face.
 - Optional face detection and recognition (OpenCV YuNet + SFace): enrol the
-  people by hand, or let the camera enrol whoever shows up.
+  people by hand, or let the camera enrol whoever shows up -- the unknown
+  faces are watched for a while first, and a person is stored with several
+  views of the face instead of one.
 - CMake presets (debug / release / asan) and strict compiler warnings.
 
 ## Requirements
@@ -175,6 +177,16 @@ with status `0`. It needs no camera and works on its own.
 | `--enroll-name=<name>` | *(none)* | name of the person being enrolled; shown on screen    |
 | `--enroll-metadata=<json>` | *(none)* | extra properties of the person, as a JSON document |
 | `--auto-enroll`       | *(off)*   | enrol every face that is not in the database yet      |
+| `--auto-enroll-mode=<m>` | `deferred` | `deferred` watches the face first, `immediate` stores it at once |
+| `--auto-enroll-samples=<n>` | `3`  | views to collect before the person is stored          |
+| `--auto-enroll-window=<s>` | `20`   | seconds to collect the views of a face                |
+| `--auto-enroll-timeout=<s>` | `10`  | seconds a face may be out of sight before it is forgotten |
+| `--auto-enroll-consistency=<f>` | `0.35` | largest distance between two views of the same face  |
+| `--auto-enroll-diversity=<f>` | `0.08` | smallest distance between two views of the same face |
+| `--auto-enroll-min-size=<px>` | `64` | smallest face that is worth keeping, in pixels        |
+| `--auto-enroll-strict`   | *(off)*   | throw a face away instead of storing it with fewer views |
+| `--auto-enroll-attach`   | *(off)*   | add the views to a person that is in the database already |
+| `--auto-enroll-verbose`  | *(off)*   | print every view that is accepted and rejected        |
 | `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
 | `--face-same-distance=<f>` | `0.6` | distance above which a face is certainly somebody new |
@@ -470,24 +482,101 @@ registered by themselves.
     --auto-enroll --face-db=postgres://user@localhost/objective_control
 ```
 
-It follows one rule:
+A face is **not** written to the database the moment it is seen. The
+application watches it for a while first: it collects the **views** of the
+face -- the picture and the embedding of every frame the face shows up in --
+and it writes the person down only when the views agree with each other and
+the face has been recognised with high confidence. A face that never becomes
+confident leaves **nothing** behind.
 
-| The face ...                        | What happens                                    |
-|-------------------------------------|-------------------------------------------------|
-| is not in the database yet           | is enrolled under an id of its own and stored    |
-| is in the database, with a name      | nothing is stored; the person is recognised       |
-| is in the database, without a name   | nothing is stored; the person is recognised       |
+The reason is that one frame is not enough material to recognise a person
+afterwards. SFace embeddings are stable across small changes, but a face
+seen once, in one pose, at one distance, is a single point in the embedding
+space. A person who is stored with three views is recognised from more than
+one angle, and a person who is stored from a single blurry frame is not
+recognised at all.
 
-The last row is the point of the mode: a face that was enrolled automatically
-has no name, and it still counts as being in the database. The person is
-recognised from the next frame on, and is not enrolled a second time.
+The life of a face that nobody knows:
+
+| The face ...                            | What happens                                     |
+|-----------------------------------------|--------------------------------------------------|
+| is not in the database yet               | is watched in memory; no row is written           |
+| ... and collects enough views           | is stored with **every** view that was collected  |
+| ... and is not seen again                | is forgotten; nothing is written                 |
+| is in the database, with a name          | nothing is stored; the person is recognised       |
+| is in the database, without a name       | nothing is stored; the person is recognised       |
+
+The last two rows are the point of the mode: a face that was enrolled
+automatically has no name, and it still counts as being in the database.
+The person is recognised from the next frame on, and is not enrolled a
+second time.
+
+##### The knobs
+
+| Option                        | Default | What it does                                              |
+|-------------------------------|---------|-----------------------------------------------------------|
+| `--auto-enroll-mode=<m>`      | `deferred` | `deferred` watches the face first, `immediate` stores it at once |
+| `--auto-enroll-samples=<n>`   | `3`     | How many views are collected before the person is stored    |
+| `--auto-enroll-window=<s>`    | `20`    | How long the views of a face are collected, in seconds     |
+| `--auto-enroll-timeout=<s>`   | `10`    | How long a face may be out of sight before it is forgotten |
+| `--auto-enroll-consistency=<f>` | `0.35` | The largest distance between two views of the same face   |
+| `--auto-enroll-diversity=<f>` | `0.08`  | The smallest distance between two views of the same face   |
+| `--auto-enroll-min-size=<px>` | `64`    | The smallest face that is worth keeping, in pixels         |
+| `--auto-enroll-strict`        | *(off)* | Throw a face away instead of storing it with the views it has |
+| `--auto-enroll-attach`        | *(off)* | Add the views to a person that is in the database already  |
+| `--auto-enroll-verbose`       | *(off)* | Print every view that is accepted and rejected            |
+
+A view only becomes a **view** of a candidate when it passes the gates:
+
+| Gate        | Rule                                                            |
+|-------------|------------------------------------------------------------------|
+| size        | the face is at least `--auto-enroll-min-size` pixels wide         |
+| detection   | the detector is at least as sure as `--face-score`               |
+| duplicate   | the view is at least `--auto-enroll-diversity` away from the other views |
+| identity    | the view is at most `--auto-enroll-consistency` away from the other views |
+
+The last two pull in opposite directions: the views of a candidate have to
+be the same person, but they have to be *different pictures* as well --
+otherwise the person is stored with three copies of the same frame. The
+defaults leave room in between.
+
+The **confidence** of a candidate is the largest distance between two of its
+views: the two views that disagree the most decide how sure the application
+is that they show one person. The person is stored when the confidence is at
+most `--auto-enroll-consistency` -- that is, when the application can
+recognise the face it is watching against its own collected views.
+
+When the collection window is over (`--auto-enroll-window`), a candidate
+that holds at least one good view and that is confident enough is stored
+with the views it has: a person who stands in front of the camera for two
+seconds and leaves is still enrolled, but with one view instead of three.
+`--auto-enroll-strict` turns that into a discard.
+
+##### What is stored
+
+A person that was enrolled automatically is stored with one row per view:
+
+| Column      | Value                                                      |
+|-------------|------------------------------------------------------------|
+| `person_id` | the id that was handed out when the person was stored        |
+| `embedding` | the embedding of the view                                    |
+| `user_name` | empty -- the name is filled in later, by the editor          |
+| `photo`     | the picture of the view                                      |
+| `metadata`  | `{"auto_enrolled": true, "views": 3, "confidence": 0.21}`     |
+
+The metadata is a property of the **person** and not of a single view, so
+it is stored with every view of that person -- which is what the face
+database editor expects. The views of one person are written in one go, so
+that the person is either stored with all of them or not at all.
 
 The id of a new person is one that has not been used yet. The ids in
 the database are read back from the store before one is handed out, so that a
 second instance of the application does not pick an id that somebody else has
 taken in the meantime. The ids are handed out in increasing order and are
 never reused, so an id always means the same person -- an id that was
-deleted does not turn up again with somebody else behind it.
+deleted does not turn up again with somebody else behind it. An id is only
+handed out when the person is stored, so a face that is never confirmed does
+not burn one.
 
 A new person is **not** called `unknown`:
 
@@ -495,18 +584,57 @@ A new person is **not** called `unknown`:
 - their name is left empty on purpose -- it is filled in later with the
   [face database editor](#reviewing-the-enrolments);
 - their metadata says where they came from: `{"auto_enrolled": true}`;
-- the picture of the face is stored with the sample, like any other enrolment.
+- the picture of the face is stored with every sample, like any other
+  enrolment.
+
+##### What the operator sees
+
+The face that is being watched is drawn in blue, with the number of views
+it has, so that it is visible that the application is still deciding:
 
 ```
 Frame 0: 1920x1080 (3 ch), 6220800 bytes, t=6454us.
-  Enrolled a new face as person 1.
-  faces: 1 (412,180 213x280 score=0.918774) -> person 1 (distance 0)
+  faces: 1 (412,180 213x280 score=0.918774) -> tracking a new face (1 view)
+  Tracking a new face (candidate 1).
 Frame 1: 1920x1080 (3 ch), 6220800 bytes, t=71204us.
-  faces: 1 (412,180 213x280 score=0.918774) -> person 1 (distance 0.0832154)
+  faces: 1 (412,180 213x280 score=0.918774) -> tracking a new face (2 views)
+Frame 2: 1920x1080 (3 ch), 6220800 bytes, t=138220us.
+  faces: 1 (412,180 213x280 score=0.918774) -> tracking a new face (3 views)
+  Enrolled person 1 with 3 view(s) (confidence 0.21).
 ```
 
-The second frame shows the same person: the face is in the database now, so
-nothing is stored for it.
+and at the end of the run:
+
+```
+Tracked 12 face(s); 9 were stored, 3 were discarded.
+Enrolled 9 new person(s) with 27 view(s) in postgres://user@localhost/objective_control.
+```
+
+A candidate that was thrown away says why:
+
+```
+  Candidate 4 discarded: 1 view(s), the face was out of sight for too long.
+```
+
+##### The old behaviour (`--auto-enroll-mode=immediate`)
+
+`--auto-enroll-mode=immediate` stores a face as soon as it is seen, the way
+the earlier versions did: one detection is one row, one embedding and one
+picture, whatever the quality of that single frame. It is the fallback for
+a deployment that wants the old behaviour, and it is what
+`--auto-enroll-samples=1` amounts to with the quality gate in front of it.
+
+##### Enriching the people that are enrolled already (`--auto-enroll-attach`)
+
+A person that was enrolled by hand with a single, bad sample stays bad.
+With `--auto-enroll-attach`, the views that are collected for a face that
+matches such a person are added to that person instead of being thrown
+away, so the person gets more resources and the recognition improves.
+
+It is **off** by default, because it writes to people that were enrolled by
+hand. The views are only added while the person holds fewer than
+`--auto-enroll-samples` samples -- without that limit, a person who stands
+in front of the camera would add three rows to the database every second.
 
 `--auto-enroll` needs `--face-db`, because a face that is never written to
 the store is lost, and it cannot be combined with `--enroll`: one of the two
@@ -565,6 +693,11 @@ that is shown on screen (`user_name`), a picture of the face (`photo`) and
 an arbitrary JSON document (`metadata`). They are stored with **every**
 sample of a person, so the store can answer "who is this?" without a second
 lookup.
+
+Several rows may share a `person_id`: a person who was enrolled
+automatically is stored with one row per view of the face. Those rows are
+written in **one transaction**, so that a person is either stored with all
+of its views or not at all.
 
 The columns were added after the table was introduced, so a table that
 predates them is **migrated in place** when the app connects -- the rows
@@ -636,7 +769,8 @@ camera.
 
 Enrolling a person **appends** one row; the samples of the other people are
 left alone. That keeps the enrolment cheap and makes it safe to enrol from
-several machines at once.
+several machines at once. A person that is enrolled automatically with
+several views appends one row per view, in one transaction.
 
 `--face-max-distance` is the cosine-distance cut-off for a match. The default
 of `0.4` is the usual "same person" threshold for SFace; lower it to be
@@ -768,15 +902,20 @@ relative defaults resolve on their own.
 
 ```
 include/objective-control/camera/camera.hpp   Public API (Camera, Frame, ...)
+include/objective-control/face/auto_enroller.hpp
+                                               Tracker of the unknown faces
 src/                                          Library implementation
 src/backends/                                 Per-backend implementations
 src/backends/http_mjpeg.hpp                   Self-contained HTTP MJPEG/snapshot client
 src/backends/rtsp_ffmpeg.cpp                  Low-latency RTSP backend (FFmpeg)
+src/face/auto_enroller.cpp                    The tracker itself
 apps/camera_demo.cpp                          Example CLI application
 apps/mjpeg_stream.hpp                         Minimal MJPEG-over-HTTP server
 scripts/setup-db.sh                           Creates the PostgreSQL role and database
 tools/face-db-editor/                         Desktop editor for the face database
 tests/camera_test.cpp                         Smoke test (no external test deps)
+tests/auto_enroller_test.cpp                  Tests of the tracker
+tests/auto_enroll_integration_test.cpp        Tracker and store together
 cmake/                                        Dependency + warning helpers
 CMakePresets.json                             Debug / release / asan presets
 ```

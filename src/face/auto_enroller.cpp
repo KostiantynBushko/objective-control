@@ -9,8 +9,10 @@
 #include "objective-control/face/auto_enroller.hpp"
 
 #include <algorithm>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <sstream>
 
 namespace oc {
 
@@ -56,6 +58,38 @@ float FaceCandidate::largestDistance(const fd::Embedding& embedding) const {
         worst = std::max(worst, view.embedding.cosineDistance(embedding));
     }
     return worst;
+}
+
+// ---------------------------------------------------------------------------
+// The samples of a person that was enrolled automatically
+// ---------------------------------------------------------------------------
+
+std::string autoEnrolledMetadata(int views, float confidence) {
+    // A confidence of 0.2134 is noise: the number says how sure the
+    // application was, and three digits are enough for that.
+    std::ostringstream out;
+    out << "{\"auto_enrolled\": true, \"views\": " << views
+        << ", \"confidence\": " << std::setprecision(3) << confidence << '}';
+    return out.str();
+}
+
+std::vector<fd::FaceEntry> makeEnrolmentEntries(const FaceCandidate& candidate,
+                                                 int person_id) {
+    const std::string metadata =
+        autoEnrolledMetadata(static_cast<int>(candidate.views.size()),
+                             candidate.confidence());
+
+    std::vector<fd::FaceEntry> entries;
+    entries.reserve(candidate.views.size());
+    for (const FaceView& view : candidate.views) {
+        fd::FaceEntry entry;
+        entry.person_id = person_id;
+        entry.embedding = view.embedding;
+        entry.info.metadata = metadata;
+        entry.info.photo = view.photo;
+        entries.push_back(entry);
+    }
+    return entries;
 }
 
 // ---------------------------------------------------------------------------

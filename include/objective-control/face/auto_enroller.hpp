@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "face-detection/face/recognizer.hpp"
+#include "face-detection/face/store.hpp"
 
 namespace oc {
 
@@ -74,6 +76,28 @@ struct FaceCandidate {
     /// Returns 0 when the candidate holds no view.
     [[nodiscard]] float largestDistance(const fd::Embedding& embedding) const;
 };
+
+/// The metadata of a person that was enrolled automatically.
+///
+/// It is a property of the **person** and not of a single view, so it is
+/// stored with every view of that person -- which is what the face
+/// database editor expects.
+///
+/// @p views is the number of views the person was stored with and
+/// @p confidence is how sure the application was that all of them show the
+/// same person.
+[[nodiscard]] std::string autoEnrolledMetadata(int views, float confidence);
+
+/// The samples of a person that was enrolled automatically.
+///
+/// One sample per view of the candidate: the same person id, the embedding
+/// of the view, the picture of the face and the metadata of the person.
+///
+/// The samples belong together, so they are meant to be written to the
+/// store in one go -- `fd::FaceStore::addAll` -- and a person is then
+/// either stored with all of its views or not at all.
+[[nodiscard]] std::vector<fd::FaceEntry>
+makeEnrolmentEntries(const FaceCandidate& candidate, int person_id);
 
 /// Watches the faces that are not in the database yet.
 ///
