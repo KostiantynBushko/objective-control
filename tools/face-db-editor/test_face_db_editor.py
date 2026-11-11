@@ -16,6 +16,7 @@ Run them with::
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tkinter as tk
@@ -68,13 +69,20 @@ class EditorWindowTest(unittest.TestCase):
         self.editor = FaceDbEditor(self.root, self.dsn, TEST_TABLE)
         self.addCleanup(self.editor.store.close)
 
-    def add_sample(self, person_id: int, name: str | None = None) -> None:
+    def add_sample(
+        self,
+        person_id: int,
+        name: str | None = None,
+        embedding: list[float] | None = None,
+    ) -> None:
+        if embedding is None:
+            embedding = [0.1] * 128
         with psycopg.connect(self.dsn, autocommit=True) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     f"INSERT INTO {TEST_TABLE} (person_id, embedding, user_name) "
                     "VALUES (%s, %s, %s)",
-                    (person_id, [0.1] * 128, name),
+                    (person_id, embedding, name),
                 )
 
     # -- the button is a toggle ---------------------------------------------
@@ -177,6 +185,82 @@ class EditorWindowTest(unittest.TestCase):
         self.editor.connect()
         self.assertTrue(self.editor.store.connected)
         self.assertEqual(self.editor.connect_button.cget("text"), "Disconnect")
+
+    # -- the embedding of a sample -------------------------------------------
+
+    def test_the_embedding_of_the_sample_is_shown(self) -> None:
+        self.add_sample(1, "Ada Lovelace", [0.5, -0.25, 0.125])
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        text = self.editor.embedding_text.get("1.0", "end-1c")
+        self.assertIn("0.500000", text)
+        self.assertIn("-0.250000", text)
+        self.assertIn("0.125000", text)
+
+    def test_the_summary_says_how_many_values_the_embedding_has(self) -> None:
+        self.add_sample(1, "Ada Lovelace", [0.5, -0.25, 0.125])
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        summary = self.editor.embedding_summary_var.get()
+        self.assertIn("3 values", summary)
+
+    def test_the_summary_says_when_the_embedding_has_an_odd_length(self) -> None:
+        # The library always writes a vector of 128 values, so a row with
+        # another number of them was written by something else.
+        self.add_sample(1, "Ada Lovelace", [0.5, -0.25, 0.125])
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        summary = self.editor.embedding_summary_var.get()
+        self.assertIn("3 values", summary)
+        self.assertIn("expected 128", summary)
+
+    def test_the_embedding_cannot_be_edited(self) -> None:
+        # The embedding is written by the application, and the editor only
+        # shows what a person is recognised by.
+        self.add_sample(1, "Ada Lovelace")
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        self.assertEqual(str(self.editor.embedding_text.cget("state")), "disabled")
+
+    def test_the_copy_button_is_disabled_without_an_embedding(self) -> None:
+        self.editor.refresh()
+        self.assertEqual(
+            str(self.editor.copy_embedding_button.cget("state")), "disabled"
+        )
+
+    def test_copying_the_embedding_puts_it_on_the_clipboard(self) -> None:
+        values = [0.5, -0.25, 0.125]
+        self.add_sample(1, "Ada Lovelace", values)
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        self.editor.copy_embedding_button.invoke()
+
+        self.assertEqual(json.loads(self.editor.root.clipboard_get()), values)
+
+    def test_disconnecting_clears_the_embedding(self) -> None:
+        self.add_sample(1, "Ada Lovelace", [0.5, -0.25, 0.125])
+        self.editor.refresh()
+        self.editor.people_tree.selection_set("1")
+        self.editor._on_person_selected(None)  # noqa: SLF001
+
+        self.editor.disconnect()
+
+        self.assertEqual(
+            self.editor.embedding_text.get("1.0", "end-1c").strip(), ""
+        )
+        self.assertEqual(
+            str(self.editor.copy_embedding_button.cget("state")), "disabled"
+        )
 
 
 class StubStore:
@@ -303,6 +387,16 @@ class LayoutTest(unittest.TestCase):
 
     def test_the_metadata_has_room(self) -> None:
         self.assertGreater(self.editor.metadata_text.winfo_height(), 0)
+
+    def test_the_embedding_has_room(self) -> None:
+        # The list of the values must not collapse when the window is too
+        # small for everything else: it would leave the pane empty.
+        self.assertTrue(self.editor.embedding_text.winfo_ismapped())
+        self.assertGreater(self.editor.embedding_text.winfo_height(), 0)
+
+    def test_the_copy_button_of_the_embedding_is_seen(self) -> None:
+        self.assertTrue(self.editor.copy_embedding_button.winfo_ismapped())
+        self.assertGreater(self.editor.copy_embedding_button.winfo_height(), 0)
 
 
 if __name__ == "__main__":

@@ -692,6 +692,8 @@ from `$DATABASE_URL` -- the same order the app uses. It needs a display.
 The editor lists the enrolled people, shows the samples of the selected one
 with the picture of the face that was captured at the time, and stores a
 corrected name or metadata again. The picture can be saved to a file. The
+embedding of the face -- the vector the recognition model computed for it
+-- is shown next to the samples, for the sake of looking at it. The
 changes are written to every sample of the person, exactly as the app
 writes them when it enrols somebody, so the app picks them up the next time
 it loads the store.

@@ -14,12 +14,17 @@ without a display, and the SQL it builds can be read on its own.
 The column names and the semantics of the rows are the ones of
 ``third_party/face-detection/sql/schema.sql``: one row per enrolled sample,
 with the properties of the person duplicated into every row of that person.
+The embedding of the face -- the feature vector the recognition model
+computed -- is read as well, so that the editor can show what the person
+was recognised by.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -30,14 +35,18 @@ from psycopg.types.json import Jsonb
 
 __all__ = [
     "DEFAULT_TABLE",
+    "EMBEDDING_DIMENSION",
     "PROPERTY_COLUMNS",
     "FaceDbError",
     "FaceStore",
     "Person",
     "Sample",
+    "embedding_as_json",
+    "embedding_norm",
+    "format_embedding",
+    "format_metadata",
     "is_postgres_dsn",
     "parse_metadata",
-    "format_metadata",
 ]
 
 #: The table the C++ store writes to by default.
@@ -47,6 +56,10 @@ DEFAULT_TABLE = "face_enrollments"
 #: the table was introduced, so a table that predates them is used without
 #: them -- see ``FaceStore.missing_properties``.
 PROPERTY_COLUMNS = ("user_name", "photo", "metadata")
+
+#: The number of values the embedding of a face has. SFace produces a
+#: vector of this length, and the C++ library expects the same.
+EMBEDDING_DIMENSION = 128
 
 # A libpq connection string in keyword form, e.g. "host=localhost dbname=x".
 _KEYWORD_DSN = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*=")
@@ -76,6 +89,10 @@ class Sample:
     The photo is the bytes of an encoded image (a JPEG, in practice) and
     the metadata is the parsed JSON document. Both are ``None`` when the
     column is missing or the row does not fill it.
+
+    The embedding is the feature vector the face-recognition model
+    computed for the face. It is ``None`` when the table has no such a
+    column; the list is empty when the column holds an empty vector.
     """
 
     id: int
@@ -84,6 +101,7 @@ class Sample:
     photo: bytes | None
     metadata: Any
     enrolled_at: datetime | None
+    embedding: list[float] | None = None
 
 
 def is_postgres_dsn(dsn: str) -> bool:
@@ -135,6 +153,33 @@ def format_metadata(metadata: Any) -> str:
     return json.dumps(metadata, indent=2, ensure_ascii=False, sort_keys=True)
 
 
+def embedding_norm(values: Sequence[float]) -> float:
+    """The length of an embedding.
+
+    The C++ library normalises the vector before it stores it, so an
+    embedding of a real face has a length of one. A length that is far
+    from that says that the row was written by something else.
+    """
+    return math.sqrt(sum(float(value) * float(value) for value in values))
+
+
+def format_embedding(values: Sequence[float]) -> str:
+    """Renders an embedding as the text the editor shows.
+
+    Every value is on a line of its own, with its index in front of it,
+    so that a value can be picked out of it. The numbers are shown with
+    six decimals, which is more than a single-precision float holds.
+    """
+    return "\n".join(
+        f"{index:3d}  {float(value): .6f}" for index, value in enumerate(values)
+    )
+
+
+def embedding_as_json(values: Sequence[float]) -> str:
+    """The embedding as a JSON array, ready to be pasted somewhere else."""
+    return json.dumps([float(value) for value in values])
+
+
 class FaceStore:
     """The enrolled faces of one PostgreSQL table.
 
@@ -155,6 +200,7 @@ class FaceStore:
         self._conn: psycopg.Connection | None = None
         self._properties: frozenset[str] = frozenset()
         self._has_enrolled_at = False
+        self._has_embedding = False
 
     # -- connection --------------------------------------------------------
 
@@ -217,18 +263,17 @@ class FaceStore:
                 "WHERE a.attrelid = %s::regclass "
                 "  AND a.attnum > 0 AND NOT a.attisdropped "
                 "  AND a.attname = ANY(%s)",
-                (self.table, list(PROPERTY_COLUMNS)),
+                (
+                    self.table,
+                    list(PROPERTY_COLUMNS) + ["enrolled_at", "embedding"],
+                ),
             )
-            self._properties = frozenset(row[0] for row in cur.fetchall())
-
-            cur.execute(
-                "SELECT a.attname FROM pg_attribute a "
-                "WHERE a.attrelid = %s::regclass "
-                "  AND a.attnum > 0 AND NOT a.attisdropped "
-                "  AND a.attname = 'enrolled_at'",
-                (self.table,),
+            present = frozenset(row[0] for row in cur.fetchall())
+            self._properties = frozenset(
+                present.intersection(PROPERTY_COLUMNS)
             )
-            self._has_enrolled_at = cur.fetchone() is not None
+            self._has_enrolled_at = "enrolled_at" in present
+            self._has_embedding = "embedding" in present
 
     # -- what the table can hold -------------------------------------------
 
@@ -295,6 +340,8 @@ class FaceStore:
             columns.append("metadata")
         if self._has_enrolled_at:
             columns.append("enrolled_at")
+        if self._has_embedding:
+            columns.append("embedding")
 
         query = (
             "SELECT " + ", ".join(columns) + f" FROM {self._quoted_table()} "
@@ -314,6 +361,7 @@ class FaceStore:
             photo = None
             metadata = None
             enrolled_at = None
+            embedding = None
             if "user_name" in self._properties:
                 user_name = row[index]
                 index += 1
@@ -325,6 +373,9 @@ class FaceStore:
                 index += 1
             if self._has_enrolled_at:
                 enrolled_at = row[index]
+                index += 1
+            if self._has_embedding:
+                embedding = row[index]
 
             samples.append(
                 Sample(
@@ -334,6 +385,7 @@ class FaceStore:
                     photo=photo,
                     metadata=metadata,
                     enrolled_at=enrolled_at,
+                    embedding=embedding,
                 )
             )
         return samples

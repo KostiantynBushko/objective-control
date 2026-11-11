@@ -15,11 +15,13 @@ time it loads the store.
 
 ## What it does
 
-* lists the enrolled people, with their id and how many samples each of
-  them has, and filters the list as you type,
+* lists the enrolled people, with their id and how many samples each
+  of them has, and filters the list as you type,
 * shows the samples of the selected person, with the picture of the face
   that was captured at the time,
 * shows the name and the metadata of the person and stores them again,
+* shows the embedding of the selected sample -- the vector the recognition
+  model computed for the face -- and copies it to the clipboard,
 * saves the picture of a face to a file,
 * removes a person and every sample of that person.
 
@@ -79,6 +81,22 @@ table that predates them -- and that the database user is not allowed to
 alter -- is used as it is: the editor says which columns it cannot keep
 and does not offer to edit them, the same way the C++ store drops the
 properties on the way in and names the ones that are lost.
+
+## The embedding
+
+The embedding of a face is the feature vector the recognition model
+computed for it -- 128 numbers that the application matches against. The
+editor shows it next to the samples, one value per line with its index in
+front of it, together with the length of the vector.
+
+The vector is written by the application when the face is enrolled, and
+it is what the face is recognised by, so the editor only shows it: it
+cannot be edited here. The **Copy** button puts it on the clipboard as a
+JSON array, which is handy when the vector is wanted somewhere else.
+
+A vector of a real face has a length of one, because the library
+normalises it before it stores it. A length that is far from that says
+that the row was written by something that does not normalise the vector.
 
 ## The metadata
 

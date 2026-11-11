@@ -16,6 +16,8 @@ corrected:
     was captured at the time,
   * the name and the metadata of the person, which can be edited and
     stored again,
+  * the embedding of the face -- the feature vector the recognition model
+    computed for it -- which is shown for the sake of looking at it,
   * the picture of a face, which can be saved to a file.
 
 The properties are stored with *every* sample of a person, so that the
@@ -43,13 +45,32 @@ import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
-from typing import Any
 
 try:
-    from face_db import FaceDbError, FaceStore, format_metadata, parse_metadata
+    from face_db import (
+        EMBEDDING_DIMENSION,
+        FaceDbError,
+        FaceStore,
+        Sample,
+        embedding_as_json,
+        embedding_norm,
+        format_embedding,
+        format_metadata,
+        parse_metadata,
+    )
 except ImportError:  # pragma: no cover - the module sits next to this file
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from face_db import FaceDbError, FaceStore, format_metadata, parse_metadata
+    from face_db import (
+        EMBEDDING_DIMENSION,
+        FaceDbError,
+        FaceStore,
+        Sample,
+        embedding_as_json,
+        embedding_norm,
+        format_embedding,
+        format_metadata,
+        parse_metadata,
+    )
 
 
 #: How large the preview of a face is, in pixels.
@@ -66,6 +87,11 @@ MIN_ROW_HEIGHT = 20
 #: starting points, the pane grows and shrinks with the window.
 METADATA_WIDTH = 30
 METADATA_HEIGHT = 6
+
+#: The smallest height the list of the values of an embedding may have, in
+#: pixels. Without it, a window that is too small for everything else
+#: would give the space to the labels and the list would collapse.
+EMBEDDING_MIN_HEIGHT = 80
 
 #: The environment variables the connection string is taken from, in the
 #: order the C++ application looks them up in.
@@ -150,13 +176,14 @@ class FaceDbEditor:
         self._photo_image: tk.PhotoImage | None = None
         self._photo_data: bytes | None = None
         self._photo_sample_id: int | None = None
+        self._embedding: list[float] | None = None
 
         root.title("Face database editor")
         # The rows of the trees are as tall as their font, which takes
         # more room than the twenty pixels that Tk gives them, and the
         # window is therefore a little larger than it was, so that the
         # panes of the editor all have the room they ask for.
-        root.geometry("1280x900")
+        root.geometry("1440x900")
         root.minsize(900, 600)
 
         self._build_widgets()
@@ -293,8 +320,28 @@ class FaceDbEditor:
         frame.rowconfigure(1, weight=1)
         frame.columnconfigure(0, weight=1)
 
-        samples_frame = ttk.Labelframe(frame, text="Samples", padding=6)
-        samples_frame.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        # The samples of the person and the embedding of the selected one
+        # are shown side by side. The samples take little room, and the
+        # list of the values of an embedding takes a lot of it, so the
+        # two fit together well.
+        top = ttk.PanedWindow(frame, orient="horizontal")
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.add(self._build_samples_pane(top), weight=1)
+        top.add(self._build_embedding_pane(top), weight=1)
+
+        lower = ttk.Frame(frame)
+        lower.grid(row=1, column=0, sticky="nsew")
+        lower.columnconfigure(1, weight=1)
+        lower.rowconfigure(0, weight=1)
+
+        self._build_photo_pane(lower)
+        self._build_properties_pane(lower)
+
+        return frame
+
+    def _build_samples_pane(self, parent: ttk.Frame) -> ttk.Frame:
+        """Builds the pane that lists the samples of the selected person."""
+        samples_frame = ttk.Labelframe(parent, text="Samples", padding=6)
         samples_frame.columnconfigure(0, weight=1)
 
         columns = ("id", "enrolled", "photo")
@@ -314,15 +361,7 @@ class FaceDbEditor:
         self.samples_tree.configure(yscrollcommand=scrollbar.set)
         self.samples_tree.bind("<<TreeviewSelect>>", self._on_sample_selected)
 
-        lower = ttk.Frame(frame)
-        lower.grid(row=1, column=0, sticky="nsew")
-        lower.columnconfigure(1, weight=1)
-        lower.rowconfigure(0, weight=1)
-
-        self._build_photo_pane(lower)
-        self._build_properties_pane(lower)
-
-        return frame
+        return samples_frame
 
     def _build_photo_pane(self, parent: ttk.Frame) -> None:
         frame = ttk.Labelframe(parent, text="Face", padding=6)
@@ -411,6 +450,47 @@ class FaceDbEditor:
         )
         hint.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(8, 0))
 
+    def _build_embedding_pane(self, parent: ttk.Frame) -> ttk.Frame:
+        """Builds the pane that shows the embedding of the selected sample.
+
+        The embedding is the feature vector the recognition model computed
+        for the face. It cannot be edited here: it is what the face is
+        recognised by, and it is written when the face is enrolled.
+        """
+        frame = ttk.Labelframe(parent, text="Embedding (read only)", padding=6)
+        frame.columnconfigure(0, weight=1)
+        # The list of the values always has room, even when the window is
+        # too small for everything else: without it, the pane would give
+        # its space to the labels and the list would collapse.
+        frame.rowconfigure(1, weight=1, minsize=EMBEDDING_MIN_HEIGHT)
+
+        # The number of the values, the button that copies them and the
+        # length of the vector are kept on one line, so that the pane
+        # does not take more room than it has to.
+        header = ttk.Frame(frame)
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.embedding_summary_var = tk.StringVar(value="no embedding")
+        ttk.Label(header, textvariable=self.embedding_summary_var).pack(side="left")
+        self.copy_embedding_button = ttk.Button(
+            header, text="Copy", command=self.copy_embedding, state="disabled"
+        )
+        self.copy_embedding_button.pack(side="left", padx=(8, 0))
+        self.embedding_length_var = tk.StringVar(value="")
+        ttk.Label(header, textvariable=self.embedding_length_var).pack(side="left", padx=(8, 0))
+
+        # The text is not editable: the embedding is written by the
+        # application, and the editor only shows it.
+        self.embedding_text = tk.Text(
+            frame, width=30, height=4, wrap="none", state="disabled"
+        )
+        self.embedding_text.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
+
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.embedding_text.yview)
+        scroll.grid(row=1, column=1, sticky="ns", pady=(4, 0))
+        self.embedding_text.configure(yscrollcommand=scroll.set)
+
+        return frame
+
     def _build_status_bar(self, parent: ttk.Frame) -> None:
         self.status_var = tk.StringVar(value="Not connected.")
         bar = ttk.Frame(parent)
@@ -485,6 +565,10 @@ class FaceDbEditor:
         self.refresh_button.configure(state=state)
         self.name_entry.configure(state=state)
         self.metadata_text.configure(state=state)
+        if not connected:
+            # The embedding of a sample cannot be copied without a
+            # database to read it from.
+            self.copy_embedding_button.configure(state="disabled")
 
         missing = self.store.missing_properties
         if missing and connected:
@@ -636,17 +720,62 @@ class FaceDbEditor:
                 self._show_sample(sample)
                 return
 
-    def _show_sample(self, sample: Any) -> None:
+    def _show_sample(self, sample: Sample) -> None:
         """Shows the picture and the properties of one sample."""
         self._photo_sample_id = sample.id
         self._photo_data = sample.photo
         self._show_photo(sample.photo)
+        self._show_embedding(sample.embedding)
 
         if "user_name" not in self.store.missing_properties:
             self.name_var.set(sample.user_name or "")
         if "metadata" not in self.store.missing_properties:
             self.metadata_text.delete("1.0", "end")
             self.metadata_text.insert("1.0", format_metadata(sample.metadata))
+
+    def _show_embedding(self, values: list[float] | None) -> None:
+        """Shows the embedding of a sample.
+
+        The values are put in a text that cannot be edited: the
+        embedding is written by the application, and the editor only
+        shows what a person is recognised by.
+        """
+        self._embedding = list(values) if values else None
+
+        self.embedding_text.configure(state="normal")
+        self.embedding_text.delete("1.0", "end")
+        if self._embedding:
+            self.embedding_text.insert("1.0", format_embedding(self._embedding))
+            summary = f"{len(self._embedding)} values"
+            if len(self._embedding) != EMBEDDING_DIMENSION:
+                # The library always writes a vector of this length, so a
+                # row with another one was written by something else.
+                summary += f" (expected {EMBEDDING_DIMENSION})"
+            self.embedding_summary_var.set(summary)
+            # The length of a normalised embedding is one. A length that
+            # is far from that says that the row was written by something
+            # that does not normalise the vector.
+            self.embedding_length_var.set(
+                f"length {embedding_norm(self._embedding):.6f}"
+            )
+            self.copy_embedding_button.configure(
+                state="normal" if self.store.connected else "disabled"
+            )
+        else:
+            self.embedding_summary_var.set("no embedding")
+            self.embedding_length_var.set("")
+            self.copy_embedding_button.configure(state="disabled")
+        self.embedding_text.configure(state="disabled")
+
+    def copy_embedding(self) -> None:
+        """Copies the embedding of the sample to the clipboard."""
+        if not self._embedding:
+            self._set_status("There is no embedding to copy.")
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(embedding_as_json(self._embedding))
+        self._set_status(f"Copied the {len(self._embedding)} values of the embedding.")
 
     def _show_photo(self, data: bytes | None) -> None:
         """Puts the picture of a face into the preview."""
@@ -677,6 +806,7 @@ class FaceDbEditor:
         self._photo_sample_id = None
         self._photo_data = None
         self._show_photo(None)
+        self._show_embedding(None)
         self.name_var.set("")
         self.metadata_text.delete("1.0", "end")
 

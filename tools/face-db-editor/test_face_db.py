@@ -25,8 +25,12 @@ from psycopg.types.json import Jsonb
 
 from face_db import (
     DEFAULT_TABLE,
+    EMBEDDING_DIMENSION,
     FaceDbError,
     FaceStore,
+    embedding_as_json,
+    embedding_norm,
+    format_embedding,
     format_metadata,
     is_postgres_dsn,
     parse_metadata,
@@ -135,6 +139,41 @@ class MetadataTest(unittest.TestCase):
         self.assertEqual(parse_metadata(format_metadata(document)), document)
 
 
+class EmbeddingTest(unittest.TestCase):
+    """The embedding of a face, as the editor shows it."""
+
+    def test_every_value_is_shown_on_a_line_of_its_own(self) -> None:
+        text = format_embedding([0.5, -0.25, 0.0])
+        lines = text.splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("0.500000", lines[0])
+        self.assertIn("-0.250000", lines[1])
+        self.assertIn("0.000000", lines[2])
+
+    def test_the_index_of_a_value_is_shown_with_it(self) -> None:
+        # The index is what makes a value findable in a long list.
+        lines = format_embedding([0.5] * 128).splitlines()
+        self.assertTrue(lines[0].startswith("  0"))
+        self.assertTrue(lines[1].startswith("  1"))
+        self.assertTrue(lines[-1].startswith("127"))
+
+    def test_the_length_of_an_embedding(self) -> None:
+        # The C++ library normalises the vector before it stores it.
+        self.assertAlmostEqual(embedding_norm([1.0, 0.0, 0.0]), 1.0)
+        self.assertAlmostEqual(embedding_norm([3.0, 4.0]), 5.0)
+        self.assertAlmostEqual(embedding_norm([]), 0.0)
+
+    def test_an_embedding_is_rendered_as_json(self) -> None:
+        self.assertEqual(embedding_as_json([0.5, -0.25]), "[0.5, -0.25]")
+        self.assertEqual(embedding_as_json([]), "[]")
+
+    def test_the_json_of_an_embedding_can_be_read_back(self) -> None:
+        import json
+
+        values = [0.5, -0.25, 0.0]
+        self.assertEqual(json.loads(embedding_as_json(values)), values)
+
+
 class StoreTest(unittest.TestCase):
     """The store against a real server."""
 
@@ -225,6 +264,63 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(samples[0].metadata, {"role": "admin"})
         self.assertEqual(samples[0].photo, TINY_JPEG)
         self.assertIsNotNone(samples[0].enrolled_at)
+
+    def test_the_embedding_of_a_sample_is_read(self) -> None:
+        self.add_sample(1, "Ada")
+        samples = self.store.list_samples(1)
+        self.assertEqual(len(samples), 1)
+        self.assertIsNotNone(samples[0].embedding)
+        self.assertEqual(len(samples[0].embedding), EMBEDDING_DIMENSION)
+        self.assertAlmostEqual(samples[0].embedding[0], 0.1, places=6)
+
+    def test_the_embedding_of_a_sample_is_the_one_that_was_written(self) -> None:
+        values = [0.5, -0.25, 0.125]
+        with self.store._require_connection().cursor() as cur:  # noqa: SLF001
+            cur.execute(
+                f"INSERT INTO {TEST_TABLE} (person_id, embedding, user_name) "
+                "VALUES (%s, %s, %s)",
+                (1, values, "Ada"),
+            )
+        samples = self.store.list_samples(1)
+        self.assertEqual(samples[0].embedding, values)
+
+    def test_a_table_without_an_embedding_column_is_used_as_it_is(self) -> None:
+        # A table that was made before the embedding was stored in it.
+        # The editor has to say that there is none, rather than fail.
+        legacy = f"{TEST_TABLE}_without_embedding"
+        conn = psycopg.connect(self.dsn, autocommit=True)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DROP TABLE IF EXISTS {legacy}")
+                cur.execute(
+                    f"""
+                    CREATE TABLE {legacy} (
+                        id        bigserial   PRIMARY KEY,
+                        person_id integer     NOT NULL,
+                        user_name text
+                    )
+                    """
+                )
+                cur.execute(
+                    f"INSERT INTO {legacy} (person_id, user_name) VALUES (1, 'Ada')"
+                )
+        finally:
+            conn.close()
+
+        store = FaceStore(self.dsn, legacy)
+        store.connect()
+        try:
+            samples = store.list_samples(1)
+            self.assertEqual(len(samples), 1)
+            self.assertIsNone(samples[0].embedding)
+        finally:
+            store.close()
+            cleanup = psycopg.connect(self.dsn, autocommit=True)
+            try:
+                with cleanup.cursor() as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS {legacy}")
+            finally:
+                cleanup.close()
 
     def test_samples_of_one_person_keep_their_own_picture(self) -> None:
         self.add_sample(1, "Ada", None, TINY_JPEG)
