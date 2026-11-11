@@ -41,6 +41,7 @@ import shutil
 import subprocess
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, ttk
 from typing import Any
 
@@ -53,6 +54,18 @@ except ImportError:  # pragma: no cover - the module sits next to this file
 
 #: How large the preview of a face is, in pixels.
 PREVIEW_SIZE = 220
+
+#: The smallest height a row of a tree may have, in pixels. Tk measures
+#: a row at 20 pixels whatever the font is, and the text of the row is
+#: then cut in half, so the height of the font is used instead.
+MIN_ROW_HEIGHT = 20
+
+#: How wide the metadata asks to be, in characters, and how many lines
+#: of it are shown. The metadata is a JSON document and a line of it can
+#: be long, but the pane has to fit in the window: these are only the
+#: starting points, the pane grows and shrinks with the window.
+METADATA_WIDTH = 30
+METADATA_HEIGHT = 6
 
 #: The environment variables the connection string is taken from, in the
 #: order the C++ application looks them up in.
@@ -139,8 +152,12 @@ class FaceDbEditor:
         self._photo_sample_id: int | None = None
 
         root.title("Face database editor")
-        root.geometry("1120x720")
-        root.minsize(900, 560)
+        # The rows of the trees are as tall as their font, which takes
+        # more room than the twenty pixels that Tk gives them, and the
+        # window is therefore a little larger than it was, so that the
+        # panes of the editor all have the room they ask for.
+        root.geometry("1280x900")
+        root.minsize(900, 600)
 
         self._build_widgets()
         self._show_connection_state()
@@ -153,6 +170,10 @@ class FaceDbEditor:
         if "clam" in style.theme_names():
             style.theme_use("clam")
 
+        # The rows of the trees are made as tall as their font, so that
+        # the text of a row is not cut in half.
+        self._fit_treeview_rows(style)
+
         outer = ttk.Frame(self.root, padding=8)
         outer.grid(row=0, column=0, sticky="nsew")
         self.root.rowconfigure(0, weight=1)
@@ -164,6 +185,25 @@ class FaceDbEditor:
         self._build_warning(outer)
         self._build_body(outer)
         self._build_status_bar(outer)
+
+    def _fit_treeview_rows(self, style: ttk.Style) -> None:
+        """Gives the rows of the trees the height that their font needs.
+
+        Tk measures a row of a tree at 20 pixels, whatever the font is,
+        and the text of the row is then drawn so that the upper half of
+        it falls outside of the row: a name is only half to be seen.
+        The height of the rows is set to the height of the font here,
+        which is what the text of a label needs.
+        """
+        font = style.lookup("Treeview", "font") or "TkDefaultFont"
+        try:
+            metrics = tkfont.Font(root=self.root, font=font)
+        except tk.TclError:
+            # A font that cannot be measured leaves the rows as they
+            # are, which is no worse than before.
+            return
+        height = max(MIN_ROW_HEIGHT, metrics.metrics("linespace"))
+        style.configure("Treeview", rowheight=height)
 
     def _build_connection_bar(self, parent: ttk.Frame) -> None:
         bar = ttk.Frame(parent)
@@ -180,6 +220,10 @@ class FaceDbEditor:
         self.table_entry = ttk.Entry(bar, textvariable=self.table_var, width=20)
         self.table_entry.grid(row=0, column=3, sticky="w", padx=6)
 
+        # The button is a toggle and says what it is going to do: it
+        # offers to close the database while the editor is connected and
+        # to open it otherwise. ``_show_connection_state`` keeps the
+        # label and the action in step with the connection.
         self.connect_button = ttk.Button(bar, text="Connect", command=self.connect)
         self.connect_button.grid(row=0, column=4, sticky="e")
 
@@ -229,6 +273,18 @@ class FaceDbEditor:
         scrollbar.grid(row=1, column=1, sticky="ns")
         self.people_tree.configure(yscrollcommand=scrollbar.set)
         self.people_tree.bind("<<TreeviewSelect>>", self._on_person_selected)
+
+        # An empty tree looks like a broken one, so the reason why it is
+        # empty is written under it.
+        self.people_empty_label = ttk.Label(
+            frame,
+            text="",
+            foreground="#555555",
+            justify="left",
+            wraplength=280,
+        )
+        self.people_empty_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.people_empty_label.grid_remove()
 
         return frame
 
@@ -298,8 +354,14 @@ class FaceDbEditor:
     def _build_properties_pane(self, parent: ttk.Frame) -> None:
         frame = ttk.Labelframe(parent, text="Properties", padding=6)
         frame.grid(row=0, column=1, sticky="nsew")
-        frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+        # The weight belongs to the column of the entry and of the
+        # metadata, and not to the column of the labels: a column that
+        # has the weight is the first one that is made narrower when
+        # the pane is too narrow for its contents, and the labels of
+        # the pane would then be squeezed out of sight.
+        frame.columnconfigure(0, weight=0)
+        frame.columnconfigure(1, weight=1)
+        frame.rowconfigure(1, weight=1)
 
         ttk.Label(frame, text="Name:").grid(row=0, column=0, sticky="w")
         self.name_var = tk.StringVar()
@@ -307,11 +369,22 @@ class FaceDbEditor:
         self.name_entry.grid(row=0, column=1, sticky="ew", padx=6, pady=(0, 6))
 
         ttk.Label(frame, text="Metadata:").grid(row=1, column=0, sticky="nw")
-        self.metadata_text = tk.Text(frame, height=10, wrap="none", undo=True)
-        self.metadata_text.grid(row=1, column=1, rowspan=2, sticky="nsew", padx=6)
+        # The metadata is not wrapped, so a line of it can be longer
+        # than the pane. It asks for a width of its own instead of the
+        # width of eighty characters, which would take more room than
+        # the whole window, and it is given a scrollbar to the right
+        # and one below it.
+        self.metadata_text = tk.Text(
+            frame, height=METADATA_HEIGHT, width=METADATA_WIDTH, wrap="none", undo=True
+        )
+        self.metadata_text.grid(row=1, column=1, sticky="nsew", padx=6)
         metadata_scroll = ttk.Scrollbar(frame, orient="vertical", command=self.metadata_text.yview)
-        metadata_scroll.grid(row=1, column=2, rowspan=2, sticky="ns")
+        metadata_scroll.grid(row=1, column=2, sticky="ns")
         self.metadata_text.configure(yscrollcommand=metadata_scroll.set)
+
+        metadata_hscroll = ttk.Scrollbar(frame, orient="horizontal", command=self.metadata_text.xview)
+        metadata_hscroll.grid(row=2, column=1, sticky="ew", padx=6)
+        self.metadata_text.configure(xscrollcommand=metadata_hscroll.set)
 
         buttons = ttk.Frame(frame)
         buttons.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
@@ -351,10 +424,19 @@ class FaceDbEditor:
         dsn = self.dsn_var.get().strip()
         table = self.table_var.get().strip() or "face_enrollments"
 
-        self.store.close()
-        self.store = FaceStore(dsn, table)
+        if self.store.connected and self.store.dsn == dsn and self.store.table == table:
+            # Already open with the very same settings: there is nothing
+            # to reopen, so only the people are read again.
+            self.refresh()
+            return
+
         self.root.configure(cursor="watch")
         try:
+            self.store.close()
+            # The store is built inside the try, because a connection
+            # string that does not name a database raises here, and the
+            # user has to be told about it instead of the editor dying.
+            self.store = FaceStore(dsn, table)
             self.store.connect()
         except FaceDbError as exc:
             self._show_connection_state()
@@ -368,10 +450,34 @@ class FaceDbEditor:
         self._set_status(f"Connected to {table}.")
         self.refresh()
 
+    def disconnect(self) -> None:
+        """Closes the database and empties the editor."""
+        self.store.close()
+        self._people = []
+        for item in self.people_tree.get_children():
+            self.people_tree.delete(item)
+        self._clear_detail()
+        self.people_empty_label.grid_remove()
+        self._show_connection_state()
+        self._set_status("Disconnected.")
+
     def _show_connection_state(self) -> None:
         """Enables the widgets that need a connection, and says what is missing."""
         connected = self.store.connected
         state = "normal" if connected else "disabled"
+
+        # The button says what it is going to do, so that it never looks
+        # like it is offering to open a database that is already open.
+        if connected:
+            self.connect_button.configure(text="Disconnect", command=self.disconnect)
+        else:
+            self.connect_button.configure(text="Connect", command=self.connect)
+
+        # The connection string belongs to the open connection, so it is
+        # only edited while there is none.
+        entry_state = "disabled" if connected else "normal"
+        self.dsn_entry.configure(state=entry_state)
+        self.table_entry.configure(state=entry_state)
 
         self.save_button.configure(state=state)
         self.format_button.configure(state=state)
@@ -423,8 +529,10 @@ class FaceDbEditor:
         for item in self.people_tree.get_children():
             self.people_tree.delete(item)
 
+        people = getattr(self, "_people", [])
         needle = self.filter_var.get().strip().lower()
-        for person in getattr(self, "_people", []):
+        shown = 0
+        for person in people:
             if needle:
                 haystack = f"{person.person_id} {person.user_name or ''}".lower()
                 if needle not in haystack:
@@ -436,6 +544,9 @@ class FaceDbEditor:
                 iid=str(person.person_id),
                 values=(person.person_id, name, person.samples),
             )
+            shown += 1
+
+        self._show_people_hint(shown, len(people))
 
         # Keep the selection across a refresh, so that a change that was
         # just saved does not throw the user back to the top of the list.
@@ -445,6 +556,30 @@ class FaceDbEditor:
             self._load_person(selected)
         else:
             self._clear_detail()
+
+    def _show_people_hint(self, shown: int, total: int) -> None:
+        """Says why the list of people is empty, when it is."""
+        if not self.store.connected:
+            # Nothing was read, so nothing can be said about the table.
+            self.people_empty_label.grid_remove()
+            return
+
+        if shown:
+            self.people_empty_label.grid_remove()
+            return
+
+        if total:
+            # The table has people, but the filter hides all of them.
+            text = "No person matches the filter."
+        else:
+            text = (
+                "Nobody is enrolled in this table yet.\n\n"
+                "The application writes the rows when it enrols a face:\n"
+                "  objective-control-app --faces --enroll=1 \\\n"
+                "      --face-db=<this connection string>"
+            )
+        self.people_empty_label.configure(text=text)
+        self.people_empty_label.grid()
 
     def _on_person_selected(self, _event: tk.Event) -> None:
         person_id = self._selected_person_id()
@@ -734,7 +869,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    FaceDbEditor(root, dsn, args.table)
+    try:
+        FaceDbEditor(root, dsn, args.table)
+    except FaceDbError as exc:
+        print(f"Could not open the editor: {exc}", file=sys.stderr)
+        return 1
+
     root.mainloop()
     return 0
 
