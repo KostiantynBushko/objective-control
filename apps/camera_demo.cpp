@@ -112,7 +112,7 @@ bool isKnownOption(const std::string& name) {
         "recognize", "enroll", "face-db", "face-recognition-model",
         "face-max-distance", "face-same-distance", "face-db-list",
         "face-db-remove", "face-db-init", "enroll-name", "enroll-metadata",
-        "auto-enroll",
+        "auto-enroll", "face-image-size",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -222,6 +222,14 @@ Options:
                          Width the detector runs at; the frame is scaled
                          down to it, so detection costs less. 0 means native
                          resolution (default: 960)
+  --face-image-size=<px>
+                         Size of the face image that is stored with an
+                         enrolment and that the recognizer works on. A
+                         face that is smaller than this is scaled up to
+                         it, so that a person who stood far away still
+                         gets a picture of a usable size; a bigger face
+                         is left as it is. 0 keeps the size of the frame
+                         (default: 320)
   --recognize            Identify every detected face against the enrolled
                          set and print the person id; with --preview or
                          --stream the person id is drawn next to the box
@@ -483,28 +491,107 @@ fd::Image toFaceImage(const cv::Mat& mat) {
     return image;
 }
 
-// Encodes the detected face as a JPEG, so that the picture of the person
-// is stored with the enrolment. Returns an empty vector when the face
-// could not be encoded.
-std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
-                                      const fd::FaceBox& face) {
-    // A little padding around the box: the edges of a face carry
-    // information as well.
+// A face cut out of a frame.
+//
+// The cut-out carries the box and the landmarks in the coordinates of the
+// cut-out itself, so that the recognizer can be pointed at it directly.
+struct FaceCrop {
+    cv::Mat image;
+    fd::FaceBox box;
+};
+
+// Cuts the face at @p face out of @p source and scales it.
+//
+// A little padding is added around the box: the edges of a face carry
+// information as well. The cut-out is scaled *up* when it is smaller than
+// @p size, so that a face that stood far away still gives a picture of a
+// usable size. A face that is already bigger is left alone -- shrinking
+// it would throw away detail that the picture can show.
+//
+// A size of 0 keeps the cut-out as it is.
+bool cropFace(const cv::Mat& source, const fd::FaceBox& face, int size,
+              FaceCrop& out) {
     const int pad = std::max(face.width, face.height) / 4;
     const int x = std::max(0, face.x - pad);
     const int y = std::max(0, face.y - pad);
     const int width = std::min(source.cols - x, face.width + 2 * pad);
     const int height = std::min(source.rows - y, face.height + 2 * pad);
     if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    cv::Mat crop = source(cv::Rect(x, y, width, height));
+
+    // Scale the cut-out up when it is smaller than the wanted size.
+    double factor = 1.0;
+    if (size > 0) {
+        const int longest = std::max(width, height);
+        if (longest < size) {
+            factor = static_cast<double>(size) / static_cast<double>(longest);
+        }
+    }
+    if (factor != 1.0) {
+        const int scaledWidth =
+            std::max(1, static_cast<int>(std::lround(width * factor)));
+        const int scaledHeight =
+            std::max(1, static_cast<int>(std::lround(height * factor)));
+        cv::Mat scaled;
+        // The cubic filter is a low-pass one, so the picture does not
+        // get the hard edges that a bilinear stretch would give it.
+        cv::resize(crop, scaled, cv::Size(scaledWidth, scaledHeight), 0.0,
+                   0.0, cv::INTER_CUBIC);
+        crop = scaled;
+    }
+
+    // The box and the landmarks move with the cut-out.
+    fd::FaceBox moved = face;
+    moved.x = static_cast<int>(std::lround((face.x - x) * factor));
+    moved.y = static_cast<int>(std::lround((face.y - y) * factor));
+    moved.width = static_cast<int>(std::lround(face.width * factor));
+    moved.height = static_cast<int>(std::lround(face.height * factor));
+    const float originX = static_cast<float>(x);
+    const float originY = static_cast<float>(y);
+    const float scale = static_cast<float>(factor);
+    for (std::size_t lm = 0; lm < fd::kLandmarkCount; ++lm) {
+        moved.landmarks[lm][0] = (face.landmarks[lm][0] - originX) * scale;
+        moved.landmarks[lm][1] = (face.landmarks[lm][1] - originY) * scale;
+    }
+
+    out.image = crop;
+    out.box = moved;
+    return true;
+}
+
+// Encodes the detected face as a JPEG, so that the picture of the person
+// is stored with the enrolment. Returns an empty vector when the face
+// could not be encoded.
+std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
+                                      const fd::FaceBox& face, int size) {
+    FaceCrop crop;
+    if (!cropFace(source, face, size, crop)) {
         return {};
     }
 
-    const cv::Mat crop = source(cv::Rect(x, y, width, height));
     std::vector<uchar> buffer;
-    if (!cv::imencode(".jpg", crop, buffer, {cv::IMWRITE_JPEG_QUALITY, 85})) {
+    if (!cv::imencode(".jpg", crop.image, buffer, {cv::IMWRITE_JPEG_QUALITY, 95})) {
         return {};
     }
     return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
+}
+
+// Computes the embedding of the face at @p face.
+//
+// The face is cut out of the frame and scaled first, so that the
+// embedding is computed from the very image that is stored with the
+// enrolment: what the editor shows of a person is what was recognised.
+bool embedFace(const cv::Mat& source, const fd::FaceBox& face, int size,
+               const fd::FaceRecognizer& recognizer,
+               fd::Embedding& embedding) {
+    FaceCrop crop;
+    if (!cropFace(source, face, size, crop)) {
+        return false;
+    }
+    return recognizer.embed(toFaceImage(crop.image), crop.box, embedding);
 }
 
 // Draws a box and a caption for every detected face. A recognised person
@@ -595,6 +682,24 @@ int main(int argc, char** argv) {
         std::atof(arg(argc, argv, "face-score", "0.6").c_str());
     const int faceDetectWidth =
         std::atoi(arg(argc, argv, "face-detect-width", "960").c_str());
+    // The size of the face image that is stored with an enrolment and
+    // that the recognizer works on. A face that is smaller than this is
+    // scaled up to it, so that a person who stood far away still gets a
+    // picture of a usable size. A bigger face is left as it is.
+    const std::string faceImageSizeStr =
+        arg(argc, argv, "face-image-size", "320");
+    int faceImageSize = 0;
+    try {
+        faceImageSize = std::stoi(faceImageSizeStr);
+    } catch (const std::exception&) {
+        faceImageSize = -1;
+    }
+    if (faceImageSize < 0) {
+        std::cerr << "Invalid --face-image-size value '" << faceImageSizeStr
+                  << "' (expected a number of pixels, or 0 to keep the size "
+                     "of the frame).\n";
+        return 2;
+    }
     const bool doRecognize = flag(argc, argv, "recognize");
     const bool autoEnroll = flag(argc, argv, "auto-enroll");
     const std::string enrollStr = arg(argc, argv, "enroll", "");
@@ -1004,10 +1109,16 @@ int main(int argc, char** argv) {
     //
     // @p pictureOf makes the picture of a face. It is empty when the build
     // cannot make one.
+    //
+    // @p embedOf computes the embedding of a face. It is empty when the
+    // build cannot make one, and the embedding is then computed from the
+    // whole frame instead.
     auto analyseFaces =
         [&](const fd::Image& image,
             const std::function<std::vector<std::uint8_t>(const fd::FaceBox&)>&
-                pictureOf) -> std::vector<FaceResult> {
+                pictureOf,
+            const std::function<bool(const fd::FaceBox&, fd::Embedding&)>&
+                embedOf) -> std::vector<FaceResult> {
         std::vector<FaceResult> results;
         if (!faceDetector) {
             return results;
@@ -1026,7 +1137,10 @@ int main(int argc, char** argv) {
             }
 
             fd::Embedding embedding;
-            if (!faceRecognizer->embed(image, face, embedding)) {
+            const bool embedded = embedOf ? embedOf(face, embedding)
+                                          : faceRecognizer->embed(image, face,
+                                                                  embedding);
+            if (!embedded) {
                 results.push_back(result);
                 continue;
             }
@@ -1107,8 +1221,16 @@ int main(int argc, char** argv) {
     auto annotateFrame = [&](cv::Mat& image) -> int {
         const fd::Image faceImage = toFaceImage(image);
         const std::vector<FaceResult> results = analyseFaces(
-            faceImage, [&](const fd::FaceBox& box) {
-                return encodeFace(image, box);
+            faceImage,
+            [&](const fd::FaceBox& box) {
+                return encodeFace(image, box, faceImageSize);
+            },
+            [&](const fd::FaceBox& box, fd::Embedding& embedding) {
+                if (!faceRecognizer) {
+                    return false;
+                }
+                return embedFace(image, box, faceImageSize, *faceRecognizer,
+                                 embedding);
             });
 
         std::vector<fd::FaceBox> boxes;
@@ -1332,18 +1454,29 @@ int main(int argc, char** argv) {
             // build can make one.
             std::function<std::vector<std::uint8_t>(const fd::FaceBox&)>
                 pictureOf;
+            // The embedding of the face is computed from the picture that
+            // is stored, so that the two always agree.
+            std::function<bool(const fd::FaceBox&, fd::Embedding&)> embedOf;
 #ifdef OC_HAVE_OPENCV
             pictureOf = [&](const fd::FaceBox& box) {
                 cv::Mat view;
                 if (!toMat(*frame, view)) {
                     return std::vector<std::uint8_t>();
                 }
-                return encodeFace(view, box);
+                return encodeFace(view, box, faceImageSize);
+            };
+            embedOf = [&](const fd::FaceBox& box, fd::Embedding& embedding) {
+                cv::Mat view;
+                if (!toMat(*frame, view) || !faceRecognizer) {
+                    return false;
+                }
+                return embedFace(view, box, faceImageSize, *faceRecognizer,
+                                 embedding);
             };
 #endif
 
             const std::vector<FaceResult> results =
-                analyseFaces(image, pictureOf);
+                analyseFaces(image, pictureOf, embedOf);
 
             facesSeen += static_cast<int>(results.size());
             std::cout << "  faces: " << results.size();
@@ -1420,7 +1553,7 @@ int main(int argc, char** argv) {
                         // so that the person can be recognised by eye later on.
                         cv::Mat view;
                         if (toMat(*frame, view)) {
-                            info.photo = encodeFace(view, box);
+                            info.photo = encodeFace(view, box, faceImageSize);
                         }
                     }
 #endif

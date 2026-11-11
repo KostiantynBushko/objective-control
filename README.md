@@ -165,6 +165,7 @@ with status `0`. It needs no camera and works on its own.
 | `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
 | `--face-score=<f>`   | *(default)*| minimum detection confidence to report a face       |
 | `--face-detect-width=<px>` | *(default)* | width the detector runs at (0 = native)  |
+| `--face-image-size=<px>` | `320` | size of the face image that is stored and recognised |
 | `--recognize`        | *(off)*   | identify each detected face against the enrolled set  |
 | `--face-db=<target>` | *(none)*  | face database: a file path or a `postgres://…` connection string (load + save) |
 | `--face-db-list`     | *(off)*   | list the enrolled people and exit (no camera)         |
@@ -648,6 +649,25 @@ than the threshold itself. Two things help there: a camera that is closer
 to the subject, and `--face-detect-width=0`, which runs the detector at the
 resolution of the frame. The landmarks are then measured on the pixels
 themselves, and the embedding that is computed from them is steadier.
+
+#### The size of the face image (`--face-image-size`)
+
+The face is cut out of the frame, and the cut-out is what is stored with
+the enrolment and what the recognizer works on. `--face-image-size=<px>`
+sets how large that cut-out is: a face that is smaller than the given size
+is scaled up to it, and a face that is already bigger is left alone. The
+default is 320 pixels, which is the size of a picture of a face that is
+worth looking at; `0` keeps the size the face had in the frame.
+
+The same image is used for both, so that the picture in the editor is
+exactly the one the face was recognised by.
+
+Scaling a face up does not invent detail -- it cannot make a face that
+was far away as good as one that was close. It makes the stored picture
+usable, and it keeps the picture and the embedding in step. A face that is
+recognised badly is a face that had too few pixels in the frame: raise
+`--width`/`--height` for that, and lower `--face-detect-width` towards 0
+so that the landmarks are measured on the pixels themselves.
 
 #### Reviewing the enrolments
 
