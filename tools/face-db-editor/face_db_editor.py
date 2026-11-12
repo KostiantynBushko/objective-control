@@ -18,13 +18,22 @@ corrected:
     stored again,
   * the embedding of the face -- the feature vector the recognition model
     computed for it -- which is shown for the sake of looking at it,
-  * the picture of a face, which can be saved to a file.
+  * the picture of a face, which can be saved to a file,
+  * the people that are the same person, which can be merged into one
+    another by hand.
 
 The properties are stored with *every* sample of a person, so that the
 store can answer "who is this?" without a second lookup. The editor keeps
 that promise: a change to the name or to the metadata is written to all
 the samples of the person, exactly as the C++ store writes them when it
 enrols somebody.
+
+A face that was enrolled twice -- in two sessions, with another light and
+another distance -- ends up as two people in the table. The **Merge
+person...** button puts such a pair back together: the samples of the
+people that are picked are moved to the person that is selected, which
+keeps its id. This is what ``objective-control-app
+--face-db-merge=<from>:<to>`` does, only by hand.
 
 Run it with::
 
@@ -44,6 +53,7 @@ import subprocess
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
+from collections.abc import Sequence
 from tkinter import filedialog, messagebox, ttk
 
 try:
@@ -51,6 +61,7 @@ try:
         EMBEDDING_DIMENSION,
         FaceDbError,
         FaceStore,
+        Person,
         Sample,
         embedding_as_json,
         embedding_norm,
@@ -64,6 +75,7 @@ except ImportError:  # pragma: no cover - the module sits next to this file
         EMBEDDING_DIMENSION,
         FaceDbError,
         FaceStore,
+        Person,
         Sample,
         embedding_as_json,
         embedding_norm,
@@ -96,6 +108,20 @@ EMBEDDING_MIN_HEIGHT = 80
 #: The environment variables the connection string is taken from, in the
 #: order the C++ application looks them up in.
 DSN_ENV_VARS = ("FACE_DB_URL", "DATABASE_URL")
+
+#: How much room the list of the people takes in the merge window, in
+#: rows. The window grows with the font of the system, so the list asks
+#: for a number of rows rather than for a number of pixels.
+MERGE_LIST_ROWS = 8
+
+#: The smallest room the list of the people may have, in pixels. Without
+#: it, a window that is too small for everything else would give the
+#: space to the labels and the list would collapse.
+MERGE_LIST_MIN_HEIGHT = 120
+
+#: How wide the texts of the merge window are, in pixels. The window is
+#: as wide as that, so that a line of them fits on a line.
+MERGE_TEXT_WIDTH = 620
 
 
 def sniff_image_format(data: bytes) -> str:
@@ -160,6 +186,212 @@ def image_to_png(data: bytes) -> bytes | None:
         if finished.returncode == 0 and finished.stdout:
             return finished.stdout
     return None
+
+
+class MergeDialog:
+    """The window that asks which people are merged into the selected one.
+
+    The person that is selected in the editor is the one that stays: it
+    keeps its id, and the samples of the people that are picked here are
+    moved to it. The rows keep their identity and the time the face was
+    enrolled, so nothing is lost but the duplicate people.
+
+    The dialog does not write anything itself: it collects the ids of
+    the people that were picked and closes. The editor does the merge.
+    """
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        store: FaceStore,
+        target: Person,
+        people: Sequence[Person],
+    ) -> None:
+        self.store = store
+        self.target = target
+        self.people = list(people)
+
+        #: The ids of the people that are merged into the target, or
+        #: None when the dialog was cancelled.
+        self.result: tuple[int, ...] | None = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("Merge people")
+        self.window.transient(parent)
+        self.window.protocol("WM_DELETE_WINDOW", self.cancel)
+        self.window.minsize(460, 400)
+
+        frame = ttk.Frame(self.window, padding=8)
+        frame.grid(row=0, column=0, sticky="nsew")
+        self.window.rowconfigure(0, weight=1)
+        self.window.columnconfigure(0, weight=1)
+        # The list of the people is the part of the window that grows
+        # and shrinks; the texts around it keep the room they need.
+        frame.rowconfigure(1, weight=1, minsize=MERGE_LIST_MIN_HEIGHT)
+        frame.columnconfigure(0, weight=1)
+
+        self._build_headline(frame)
+        self._build_people(frame)
+        self._build_summary(frame)
+        self._build_buttons(frame)
+
+        self._fit_window()
+        self._update_summary()
+
+    # -- widgets ------------------------------------------------------------
+
+    def _fit_window(self) -> None:
+        """Makes the window as large as its contents ask for.
+
+        The texts of the window grow with the font of the system, and a
+        font that is bigger than usual would push the buttons out of
+        sight. The window therefore takes the size of its contents, as
+        long as that fits on the screen.
+
+        The window only grows: it is not made smaller when the texts
+        become shorter again.
+        """
+        self.window.update_idletasks()
+        screen_width = self.window.winfo_screenwidth()
+        screen_height = self.window.winfo_screenheight()
+        width = min(max(self.window.winfo_reqwidth(), MERGE_TEXT_WIDTH), screen_width - 80)
+        height = min(self.window.winfo_reqheight(), screen_height - 80)
+        width = max(width, self.window.winfo_width())
+        height = max(height, self.window.winfo_height())
+        self.window.geometry(f"{width}x{height}")
+
+    def _build_headline(self, parent: ttk.Frame) -> None:
+        """Says what the merge is going to do."""
+        name = self.target.user_name or "(no name)"
+        text = (
+            f"The samples of the people below are moved into person "
+            f"{self.target.person_id} ({name}).\n"
+            "The person keeps its id, and the rows keep the time they were "
+            "enrolled."
+        )
+        ttk.Label(
+            parent, text=text, wraplength=MERGE_TEXT_WIDTH, justify="left"
+        ).grid(row=0, column=0, sticky="w", pady=(0, 8))
+
+    def _build_people(self, parent: ttk.Frame) -> None:
+        """Builds the list of the people that can be merged in."""
+        columns = ("id", "name", "samples")
+        self.tree = ttk.Treeview(
+            parent,
+            columns=columns,
+            show="headings",
+            selectmode="extended",
+            height=MERGE_LIST_ROWS,
+        )
+        self.tree.heading("id", text="Id")
+        self.tree.heading("name", text="Name")
+        self.tree.heading("samples", text="Samples")
+        self.tree.column("id", width=60, anchor="e", stretch=False)
+        self.tree.column("name", width=220, stretch=True)
+        self.tree.column("samples", width=70, anchor="e", stretch=False)
+        self.tree.grid(row=1, column=0, sticky="nsew")
+
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.tree.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.bind("<<TreeviewSelect>>", lambda _event: self._update_summary())
+
+        for person in self.people:
+            self.tree.insert(
+                "",
+                "end",
+                iid=str(person.person_id),
+                values=(
+                    person.person_id,
+                    person.user_name if person.user_name else "",
+                    person.samples,
+                ),
+            )
+
+    def _build_summary(self, parent: ttk.Frame) -> None:
+        """Builds the line that says what the merge is going to do."""
+        self.summary_var = tk.StringVar()
+        ttk.Label(
+            parent,
+            textvariable=self.summary_var,
+            foreground="#555555",
+            wraplength=MERGE_TEXT_WIDTH,
+            justify="left",
+        ).grid(row=2, column=0, sticky="ew", pady=(8, 0))
+
+    def _build_buttons(self, parent: ttk.Frame) -> None:
+        buttons = ttk.Frame(parent)
+        buttons.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+
+        self.merge_button = ttk.Button(buttons, text="Merge", command=self.merge)
+        self.merge_button.pack(side="right")
+
+        ttk.Button(buttons, text="Cancel", command=self.cancel).pack(
+            side="right", padx=(0, 6)
+        )
+
+    # -- what the dialog does ------------------------------------------------
+
+    def _selected_people(self) -> list[Person]:
+        """The people that are picked in the list."""
+        picked = []
+        for item in self.tree.selection():
+            try:
+                person_id = int(item)
+            except ValueError:
+                continue
+            for person in self.people:
+                if person.person_id == person_id:
+                    picked.append(person)
+                    break
+        return picked
+
+    def _update_summary(self) -> None:
+        """Says what the merge is going to do, before it is done."""
+        picked = self._selected_people()
+        if not picked:
+            self.summary_var.set(
+                "Pick the people that are the same person as the one above."
+            )
+            self.merge_button.configure(state="disabled")
+            return
+
+        samples = sum(person.samples for person in picked)
+        who = "person" if len(picked) == 1 else "people"
+        text = (
+            f"{samples} sample(s) of {len(picked)} {who} will be moved into "
+            f"person {self.target.person_id}."
+        )
+
+        try:
+            name = self.store.resolve_merge_name(
+                [person.person_id for person in picked], self.target.person_id
+            )
+        except FaceDbError:
+            name = None
+        if name:
+            text += f"\nThe name of the merged person will be '{name}'."
+        else:
+            text += "\nThe merged person will have no name."
+
+        text += "\nA moved sample remembers the person it came from."
+        self.summary_var.set(text)
+        self.merge_button.configure(state="normal")
+        # The summary is longer now, so the window may have to grow.
+        self._fit_window()
+
+    def merge(self) -> None:
+        """Closes the dialog with the people that were picked."""
+        picked = self._selected_people()
+        if not picked:
+            return
+        self.result = tuple(person.person_id for person in picked)
+        self.window.destroy()
+
+    def cancel(self) -> None:
+        """Closes the dialog without merging anything."""
+        self.result = None
+        self.window.destroy()
 
 
 class FaceDbEditor:
@@ -312,6 +544,14 @@ class FaceDbEditor:
         )
         self.people_empty_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
         self.people_empty_label.grid_remove()
+
+        # The merge picks the people that are the same person out of the
+        # list, so the button belongs to the list and not to the
+        # properties of one person.
+        self.merge_button = ttk.Button(
+            frame, text="Merge person...", command=self.merge_person
+        )
+        self.merge_button.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         return frame
 
@@ -562,6 +802,7 @@ class FaceDbEditor:
         self.save_button.configure(state=state)
         self.format_button.configure(state=state)
         self.delete_button.configure(state=state)
+        self.merge_button.configure(state=state)
         self.refresh_button.configure(state=state)
         self.name_entry.configure(state=state)
         self.metadata_text.configure(state=state)
@@ -900,6 +1141,77 @@ class FaceDbEditor:
             return
 
         self._set_status(f"Saved the picture to {path} ({kind}).")
+
+    def merge_person(self) -> None:
+        """Asks which people are merged into the selected one.
+
+        The person that is selected is the one that stays: it keeps its
+        id, and the samples of the people that are picked in the dialog
+        are moved to it. This is what
+        ``objective-control-app --face-db-merge=<from>:<to>`` does, only
+        by hand.
+        """
+        person_id = self._selected_person_id()
+        if person_id is None:
+            self._set_status("Select a person first.")
+            return
+        if not self.store.connected:
+            self._set_status("The editor is not connected to a database.")
+            return
+
+        target = self._person_by_id(person_id)
+        if target is None:
+            self._set_status("Select a person first.")
+            return
+
+        others = [
+            person
+            for person in getattr(self, "_people", [])
+            if person.person_id != person_id
+        ]
+        if not others:
+            self._set_status("There is nobody else in this table to merge with.")
+            return
+
+        dialog = MergeDialog(self.root, self.store, target, others)
+        self.root.wait_window(dialog.window)
+        sources = dialog.result
+        if not sources:
+            self._set_status("The merge was cancelled.")
+            return
+
+        self.apply_merge(person_id, sources)
+
+    def apply_merge(self, target_id: int, source_ids: Sequence[int]) -> None:
+        """Merges the people into the target and loads the list again."""
+        self.root.configure(cursor="watch")
+        try:
+            result = self.store.merge_people(source_ids, target_id)
+        except FaceDbError as exc:
+            self._set_status(f"Could not merge: {exc}")
+            messagebox.showerror("Face database editor", str(exc), parent=self.root)
+            return
+        finally:
+            self.root.configure(cursor="")
+
+        # The list is loaded first: the refresh tells what it found, and
+        # the merge is what the user wants to read afterwards. The
+        # events that the refresh queued -- the selection of the tree --
+        # are dealt with first, so that they do not have the last word
+        # about what the status bar says.
+        self.refresh()
+        self.root.update()
+        self._set_status(
+            f"Moved {result.moved} sample(s) to person {result.target_id} "
+            f"({result.kept} sample(s) were there already)."
+        )
+
+    def _person_by_id(self, person_id: int) -> Person | None:
+        """The person with that id, out of the ones that are listed."""
+        for person in getattr(self, "_people", []):
+            if person.person_id == person_id:
+                return person
+        return None
 
     def delete_person(self) -> None:
         """Removes every sample of the selected person."""

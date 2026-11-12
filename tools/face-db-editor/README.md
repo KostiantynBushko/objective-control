@@ -23,6 +23,7 @@ time it loads the store.
 * shows the embedding of the selected sample -- the vector the recognition
   model computed for the face -- and copies it to the clipboard,
 * saves the picture of a face to a file,
+* merges the people that are the same person into one another,
 * removes a person and every sample of that person.
 
 The properties are stored with *every* sample of a person, so that the
@@ -60,6 +61,61 @@ Both a URL (`postgres://user@host/database`) and a libpq keyword string
 (`host=localhost dbname=objective_control`) are accepted. The C++
 application only takes the URL form, because a target that does not start
 with `postgres://` is a file there.
+
+## Merging people
+
+A face that was enrolled twice -- in two sessions, with another light and
+another distance -- ends up as two people in the table. The picture of a
+person does not tell the two apart: they look like one person, which is
+exactly why the application could not keep them together.
+
+The **Merge person...** button -- it is under the list of the people --
+puts such a pair back together. The person that is selected in the list
+is the one that stays: it keeps its id, and the samples of the people
+that are picked in the window are moved to it.
+
+```
+Merge people
+
+The samples of the people below are moved into person 1 (Ada Lovelace).
+The person keeps its id, and the rows keep the time they were enrolled.
+
+  Id   Name          Samples
+   2                 1
+   3   Bob           2
+
+3 sample(s) of 2 people will be moved into person 1.
+The name of the merged person will be 'Ada Lovelace'.
+A moved sample remembers the person it came from.
+```
+
+What the merge does:
+
+| | |
+|---|---|
+| the samples of the people that are picked | are moved to the selected person |
+| the id of the selected person | does not change |
+| the rows themselves | keep their identity, their picture, their embedding and the time the face was enrolled |
+| the name | is the name of the selected person, or -- when it has none -- the name of one of the people that are merged into it |
+| the metadata of a moved sample | keeps what it had, and says where the sample came from: `merged_from_person_id` |
+| the metadata of the samples of the selected person | is left alone |
+
+The name is a property of the person and is stored with every sample of
+it, so it is written to every sample of the merged person. The metadata
+of a sample that was moved before keeps the id it came from, because that
+is the more useful of the two.
+
+Everything happens in one transaction: the people are either merged
+completely or not at all.
+
+This is the same thing that
+`objective-control-app --face-db-merge=<from>:<to>` does, only by hand:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control \
+    --face-db-merge=9,10:1
+```
 
 ## The table
 

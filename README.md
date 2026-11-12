@@ -57,8 +57,8 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
 - Optional dependencies degrade gracefully (e.g. no OpenCV → still builds with
   the built-in backends).
 - A desktop editor for the face database (`tools/face-db-editor`): review the
-  enrolled people, correct their names and metadata, and look at the picture
-  of a face.
+  enrolled people, correct their names and metadata, look at the picture of a
+  face, and merge the people that are the same person.
 - Optional face detection and recognition (OpenCV YuNet + SFace): enrol the
   people by hand, or let the camera enrol whoever shows up -- the unknown
   faces are watched for a while first, and a person is stored with several
@@ -957,6 +957,16 @@ embedding of the face -- the vector the recognition model computed for it
 changes are written to every sample of the person, exactly as the app
 writes them when it enrols somebody, so the app picks them up the next time
 it loads the store.
+
+The editor can also **merge** people by hand. A face that was enrolled
+twice -- in two sessions, with another light and another distance -- ends
+up as two people in the table, and the **Merge person...** button puts
+such a pair back together: the samples of the people that are picked are
+moved to the person that is selected, which keeps its id. The rows keep
+their identity and the time the face was enrolled, and the metadata of a
+moved sample says where it came from. It is the same thing that
+[`--face-db-merge`](#finding-the-people-that-were-enrolled-twice) does on
+the command line, only by hand.
 
 See [`tools/face-db-editor/README.md`](tools/face-db-editor/README.md) for
 the details.

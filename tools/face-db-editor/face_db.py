@@ -17,6 +17,12 @@ with the properties of the person duplicated into every row of that person.
 The embedding of the face -- the feature vector the recognition model
 computed -- is read as well, so that the editor can show what the person
 was recognised by.
+
+The layer can also merge people: a face that was enrolled twice ends up
+as two people in the table, and ``merge_people`` puts such a pair back
+together. The rows keep their identity and the time the face was
+enrolled; only the person they belong to changes. That is what
+``objective-control-app --face-db-merge=<from>:<to>`` does.
 """
 
 from __future__ import annotations
@@ -39,6 +45,7 @@ __all__ = [
     "PROPERTY_COLUMNS",
     "FaceDbError",
     "FaceStore",
+    "MergeResult",
     "Person",
     "Sample",
     "embedding_as_json",
@@ -80,6 +87,25 @@ class Person:
     person_id: int
     samples: int
     user_name: str | None
+
+
+@dataclass(frozen=True)
+class MergeResult:
+    """What a merge of people did.
+
+    The samples of the *sources* were moved to the *target*. The rows
+    keep their identity and the time the face was enrolled; only the
+    person they belong to changed.
+
+    ``kept`` is the number of samples the target already had, and
+    ``name`` is the name the merged person has afterwards.
+    """
+
+    target_id: int
+    sources: tuple[int, ...]
+    moved: int
+    kept: int
+    name: str | None
 
 
 @dataclass(frozen=True)
@@ -459,7 +485,186 @@ class FaceStore:
                 f"could not remove the person {person_id}: {exc}"
             ) from exc
 
+    # -- merging ------------------------------------------------------------
+
+    def resolve_merge_name(
+        self, source_ids: Sequence[int], target_id: int
+    ) -> str | None:
+        """The name the merged person will have.
+
+        It is the name of the target when the target has one, and the
+        name of one of the sources otherwise. That is the rule the C++
+        application follows in ``--face-db-merge``: a person that was
+        merged into keeps the name of the person it was merged into, and
+        a target without a name takes the name of the person that was
+        merged into it.
+
+        The names are read the way ``list_people`` reads them: the
+        first name of the rows of a person is the name of that person.
+        """
+        if "user_name" not in self._properties:
+            return None
+
+        ids = [int(value) for value in source_ids]
+        conn = self._require_connection()
+        query = (
+            "SELECT person_id, user_name FROM "
+            + self._quoted_table()
+            + " WHERE person_id = ANY(%s) ORDER BY id"
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, ([target_id] + ids,))
+                rows = cur.fetchall()
+        except psycopg.Error as exc:
+            raise FaceDbError(f"could not read the people to merge: {exc}") from exc
+
+        names: dict[int, str] = {}
+        for row in rows:
+            person_id = int(row[0])
+            user_name = row[1]
+            if user_name and person_id not in names:
+                names[person_id] = user_name
+
+        if target_id in names:
+            return names[target_id]
+        for person_id in ids:
+            if person_id in names:
+                return names[person_id]
+        return None
+
+    def merge_people(self, source_ids: Sequence[int], target_id: int) -> MergeResult:
+        """Moves the samples of some people to another one.
+
+        The people whose samples are moved are the *sources*, and the
+        person they are moved to is the *target*. The rows keep their
+        identity and the time the face was enrolled; only the person
+        they belong to changes. This is what
+        ``objective-control-app --face-db-merge=<from>:<to>`` does.
+
+        The name of the merged person is the name of the target, or the
+        name of a source when the target has none -- see
+        ``resolve_merge_name``. It is written to every sample of the
+        merged person, because the name is a property of the person and
+        is stored with every sample of it.
+
+        The metadata of a moved sample says where it came from: the id
+        of the person it belonged to is added to it as
+        ``merged_from_person_id``, unless it is already there. A sample
+        that was moved before keeps the id it came from: that is the
+        more useful of the two. The metadata of the samples of the
+        target is left alone -- they did not come from anywhere.
+
+        Everything happens in one transaction: the people are either
+        merged completely or not at all.
+        """
+        target_id = int(target_id)
+        sources: list[int] = []
+        for value in source_ids:
+            person_id = int(value)
+            if person_id != target_id and person_id not in sources:
+                sources.append(person_id)
+
+        if not sources:
+            raise FaceDbError(
+                "a merge needs at least one person that is merged into another one."
+            )
+
+        conn = self._require_connection()
+
+        # The people have to be there: a merge of people that are not in
+        # the table would quietly do nothing.
+        counts = self._sample_counts([target_id] + sources)
+        if counts.get(target_id, 0) == 0:
+            raise FaceDbError(f"the person {target_id} is not in the table.")
+        if not any(counts.get(person_id, 0) for person_id in sources):
+            raise FaceDbError(
+                "none of the people to merge is in the table: "
+                + ", ".join(str(person_id) for person_id in sources)
+                + "."
+            )
+
+        kept = counts.get(target_id, 0)
+        name = self.resolve_merge_name(sources, target_id)
+
+        moved = 0
+        with conn.transaction():
+            for person_id in sources:
+                moved += self._move_samples(person_id, target_id, name)
+            if name is not None and "user_name" in self._properties:
+                # The name is a property of the person, so every sample
+                # of the merged person carries it.
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE {self._quoted_table()} SET user_name = %s "
+                        "WHERE person_id = %s",
+                        (name, target_id),
+                    )
+
+        return MergeResult(
+            target_id=target_id,
+            sources=tuple(sources),
+            moved=moved,
+            kept=kept,
+            name=name,
+        )
+
     # -- helpers ------------------------------------------------------------
+
+    def _sample_counts(self, person_ids: Sequence[int]) -> dict[int, int]:
+        """How many samples each of the people has."""
+        conn = self._require_connection()
+        query = (
+            "SELECT person_id, count(*) FROM "
+            + self._quoted_table()
+            + " WHERE person_id = ANY(%s) GROUP BY person_id"
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, (list(person_ids),))
+                rows = cur.fetchall()
+        except psycopg.Error as exc:
+            raise FaceDbError(f"could not read the people to merge: {exc}") from exc
+        return {int(row[0]): int(row[1]) for row in rows}
+
+    def _move_samples(self, person_id: int, target_id: int, name: str | None) -> int:
+        """Moves the samples of one person to another one.
+
+        The row of every sample keeps its identity, its picture and its
+        embedding; only the person it belongs to, the name of that
+        person and the origin of the sample are changed.
+        """
+        conn = self._require_connection()
+        assignments = ["person_id = %s"]
+        params: list[Any] = [target_id]
+
+        if "user_name" in self._properties:
+            assignments.append("user_name = %s")
+            params.append(name)
+
+        if "metadata" in self._properties:
+            # The metadata of a person says where it came from, so that
+            # the origin of a sample is not lost.
+            assignments.append(
+                "metadata = CASE WHEN metadata ? 'merged_from_person_id' "
+                "THEN metadata "
+                "ELSE metadata || jsonb_build_object('merged_from_person_id', "
+                "%s::int) END"
+            )
+            params.append(person_id)
+
+        params.append(person_id)
+        query = (
+            f"UPDATE {self._quoted_table()} SET "
+            + ", ".join(assignments)
+            + " WHERE person_id = %s"
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                return cur.rowcount
+        except psycopg.Error as exc:
+            raise FaceDbError(f"could not merge the person {person_id}: {exc}") from exc
 
     def _quoted_table(self) -> str:
         """The table name, quoted the way the server expects it.
