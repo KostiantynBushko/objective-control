@@ -9,6 +9,43 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
                                    stream (MJPEG over HTTP), or preview
 ```
 
+## Table of contents
+
+- [Features](#features)
+- [Requirements](#requirements)
+- [Build](#build)
+  - [Using presets](#using-presets)
+  - [Without presets](#without-presets)
+- [Library API](#library-api)
+- [Command-line app](#command-line-app)
+  - [Options](#options)
+  - [Choosing a backend (`--mode`)](#choosing-a-backend---mode)
+  - [Capture frames (`--frames`, `--width`, `--height`, `--fps`)](#capture-frames---frames---width---height---fps)
+  - [Save a single frame (`--out`)](#save-a-single-frame---out)
+  - [Record video (`--record`, `--seconds`)](#record-video---record---seconds)
+  - [Stream live video (`--stream`)](#stream-live-video---stream)
+  - [Live preview (`--preview`, `--window-size`, `--window-fullscreen`)](#live-preview---preview---window-size---window-fullscreen)
+  - [Exit codes](#exit-codes)
+- [Backends](#backends)
+  - [Face detection and recognition](#face-detection-and-recognition)
+    - [Face recognition](#face-recognition)
+    - [Automatic enrolment (`--auto-enroll`)](#automatic-enrolment---auto-enroll)
+      - [The knobs](#the-knobs)
+      - [What is stored](#what-is-stored)
+      - [What the operator sees](#what-the-operator-sees)
+      - [The old behaviour (`--auto-enroll-mode=immediate`)](#the-old-behaviour---auto-enroll-modeimmediate)
+      - [Enriching the people that are enrolled already (`--auto-enroll-attach`)](#enriching-the-people-that-are-enrolled-already---auto-enroll-attach)
+  - [Where the enrolments are stored](#where-the-enrolments-are-stored)
+    - [PostgreSQL](#postgresql)
+    - [The size of the face image (`--face-image-size`)](#the-size-of-the-face-image---face-image-size)
+    - [Reviewing the enrolments](#reviewing-the-enrolments)
+    - [Locating the model files](#locating-the-model-files)
+- [CMake options](#cmake-options)
+- [Layout](#layout)
+- [Related projects](#related-projects)
+- [Design notes](#design-notes)
+- [Submodules](#submodules)
+
 ## Features
 
 - Uniform `Camera` interface: `open` / `close` / `isOpen` / `grab` + a factory.
@@ -162,11 +199,11 @@ with status `0`. It needs no camera and works on its own.
 | `--preview`           | *(off)*   | live preview window (`q`/Esc to quit)                 |
 | `--window-size=<s>`   | `native`  | preview window size: `native` or `<width>x<height>`   |
 | `--window-fullscreen` | *(off)*   | make the preview window fullscreen                    |
-| `--transport=<proto>` | `udp`     | RTSP transport: `udp` (lowest latency) or `tcp`       |
+| `--transport=<proto>` | `udp`     | RTSP transport: `udp` (lowest latency, falls back to `tcp`) or `tcp` |
 | `--faces`            | *(off)*   | run face detection on each captured frame; drawn on the image in `--preview`/`--stream` |
-| `--face-model=<path>`| *(default)*| YuNet model file used by `--faces`                   |
-| `--face-score=<f>`   | *(default)*| minimum detection confidence to report a face       |
-| `--face-detect-width=<px>` | *(default)* | width the detector runs at (0 = native)  |
+| `--face-model=<path>`| `third_party/face-detection/models/face_detection_yunet_2023mar.onnx` | YuNet model file used by `--faces` |
+| `--face-score=<f>`   | `0.6`    | minimum detection confidence to report a face       |
+| `--face-detect-width=<px>` | `960` | width the detector runs at (0 = native)  |
 | `--face-image-size=<px>` | `320` | size of the face image that is stored and recognised |
 | `--recognize`        | *(off)*   | identify each detected face against the enrolled set  |
 | `--face-db=<target>` | *(none)*  | face database: a file path or a `postgres://…` connection string (load + save) |
@@ -187,7 +224,7 @@ with status `0`. It needs no camera and works on its own.
 | `--auto-enroll-strict`   | *(off)*   | throw a face away instead of storing it with fewer views |
 | `--auto-enroll-attach`   | *(off)*   | add the views to a person that is in the database already |
 | `--auto-enroll-verbose`  | *(off)*   | print every view that is accepted and rejected        |
-| `--face-recognition-model=<path>` | *(default)* | SFace model file used by `--recognize`/`--enroll` |
+| `--face-recognition-model=<path>` | `third_party/face-detection/models/face_recognition_sface_2021dec.onnx` | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
 | `--face-same-distance=<f>` | `0.6` | distance above which a face is certainly somebody new |
 | `-h`, `--help`        | —         | print the option list and exit                         |
@@ -916,7 +953,9 @@ tools/face-db-editor/                         Desktop editor for the face databa
 tests/camera_test.cpp                         Smoke test (no external test deps)
 tests/auto_enroller_test.cpp                  Tests of the tracker
 tests/auto_enroll_integration_test.cpp        Tracker and store together
+tests/auto_enroll_cli_test.cmake              Test of --auto-enroll against the app
 cmake/                                        Dependency + warning helpers
+docs/proposals/                               Design notes of the bigger decisions
 CMakePresets.json                             Debug / release / asan presets
 ```
 
@@ -937,6 +976,19 @@ frame.height  = captured->height;
 frame.channels = captured->channels;
 frame.data    = captured->data;   // no copy
 ```
+
+## Design notes
+
+The decisions that are too big to be explained in a comment are
+written down as proposals, in [`docs/proposals`](docs/proposals):
+
+| Proposal | Status | About |
+|---------|--------|-------|
+| [`0001-deferred-auto-enrolment`](docs/proposals/0001-deferred-auto-enrolment.md) | implemented | Why `--auto-enroll` watches a face before it writes it down, how the tracker decides that two views show the same person, and what ends up in the database. |
+
+The behaviour the proposal describes is the one of
+[Automatic enrolment](#automatic-enrolment---auto-enroll); the older way
+to do it is still there as `--auto-enroll-mode=immediate`.
 
 ## Submodules
 
