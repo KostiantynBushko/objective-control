@@ -563,7 +563,7 @@ and at the end of the run:
 Captured 240 frame(s).
 Detected 240 face(s) in total.
 Recognised 237 face(s) against the database.
-Enrolled 1 new person with 3 view(s) in postgres://user@localhost/objective_control.
+Enrolled 1 new person with 3 view(s) in postgres://objective_control:objective_control@127.0.0.1:5432/objective_control.
 ```
 
 The overlay shows a face that is being tracked in blue, with the number of

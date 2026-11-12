@@ -500,7 +500,7 @@ person it belongs to:
 ./build/debug/bin/objective-control-app \
     --mode=embedded --source=/dev/video0 --enroll=42 \
     --enroll-name="Ada Lovelace" --enroll-metadata='{"role":"admin"}' \
-    --face-db=postgres://user@localhost/objective_control
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 ```
 
 The metadata has to be a JSON document; anything else is rejected before
@@ -516,7 +516,7 @@ registered by themselves.
 ```sh
 ./build/debug/bin/objective-control-app \
     --mode=embedded --source=/dev/video0 --preview \
-    --auto-enroll --face-db=postgres://user@localhost/objective_control
+    --auto-enroll --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 ```
 
 A face is **not** written to the database the moment it is seen. The
@@ -644,7 +644,7 @@ and at the end of the run:
 
 ```
 Tracked 12 face(s); 9 were stored, 3 were discarded.
-Enrolled 9 new person(s) with 27 view(s) in postgres://user@localhost/objective_control.
+Enrolled 9 new person(s) with 27 view(s) in postgres://objective_control:objective_control@127.0.0.1:5432/objective_control.
 ```
 
 A candidate that was thrown away says why:
@@ -706,7 +706,7 @@ taken from `$FACE_DB_URL` or `$DATABASE_URL`, so a deployment does not have
 to repeat it on every command line:
 
 ```sh
-export DATABASE_URL='postgres://user:secret@localhost:5432/objective_control'
+export DATABASE_URL='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
 ```
 
 #### PostgreSQL
@@ -792,13 +792,13 @@ Enrol into PostgreSQL and list who is enrolled:
 ```sh
 ./build/debug/bin/objective-control-app \
     --mode=embedded --source=/dev/video0 --enroll=42 \
-    --face-db=postgres://user@localhost/objective_control
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 
 ./build/debug/bin/objective-control-app \
-    --face-db=postgres://user@localhost/objective_control --face-db-list
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control --face-db-list
 
 ./build/debug/bin/objective-control-app \
-    --face-db=postgres://user@localhost/objective_control --face-db-remove=42
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control --face-db-remove=42
 ```
 
 The three `--face-db-*` options work on a file too, and none of them opens a
@@ -854,7 +854,7 @@ It is a small Python application with a window, in
 pip install -r tools/face-db-editor/requirements.txt
 
 python3 tools/face-db-editor/face_db_editor.py \
-    --dsn='postgres://user@localhost/objective_control'
+    --dsn='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
 ```
 
 The connection string is taken from `--dsn`, else from `$FACE_DB_URL`, else

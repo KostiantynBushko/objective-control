@@ -389,15 +389,15 @@ Examples:
 
   # Enrol into PostgreSQL instead of a file
   objective-control-app --mode=embedded --source=/dev/video0 --enroll=42 \
-      --face-db=postgres://user@localhost/objective_control
+      --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 
   # List who is enrolled in the PostgreSQL database (no camera needed)
-  objective-control-app --face-db=postgres://user@localhost/objective_control \
+  objective-control-app --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control \
       --face-db-list
 
   # Watch the camera and enrol every new face that shows up
   objective-control-app --mode=embedded --source=/dev/video0 --preview \
-      --auto-enroll --face-db=postgres://user@localhost/objective_control
+      --auto-enroll --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 
   # Store a face as soon as it is seen, the way the earlier versions did
   objective-control-app --mode=embedded --source=/dev/video0 --preview \
