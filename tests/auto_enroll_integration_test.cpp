@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -67,8 +68,9 @@ fd::Embedding embeddingAt(double degrees) {
 // one go, so that the samples of one person land together.
 class DeferredEnroller {
 public:
-    DeferredEnroller(fd::FaceStore& store, fd::FaceDatabase& database)
-        : store_(store), database_(database) {}
+    DeferredEnroller(fd::FaceStore& store, fd::FaceDatabase& database,
+                     oc::AutoEnroller::Options options = {})
+        : store_(store), database_(database), tracker_(options) {}
 
     /// Offers a face to the tracker. @p nowUs is the time it was seen at.
     void observe(const fd::Embedding& embedding, std::uint64_t nowUs) {
@@ -80,14 +82,29 @@ public:
         }
 
         // Rule 3: the face is close to somebody who is enrolled already,
-        // but it is not that person. Such a face is reported and left
-        // alone, and no candidate is started for it.
-        if (match.person_id >= 0 && match.distance <= kSameDistance) {
-            return;
+        // but it is not that person.
+        //
+        // The face is watched all the same, and its views are added to
+        // that person. The score of the *person* is used here, not the
+        // distance to the closest sample: the samples of one person
+        // disagree with each other, and a face that is in between them
+        // belongs to that person all the same.
+        fd::PersonMatchOptions personOptions;
+        personOptions.max_distance = kSameDistance;
+        const fd::FaceDatabase::PersonMatch person =
+            database_.matchPerson(embedding, personOptions);
+
+        // The person the views are added to, when the face belongs to
+        // somebody who is in the database already.
+        int attachTo = -1;
+
+        if (person.matched) {
+            attachTo = person.person_id;
+        } else {
+            // Rules 2 and 4: the face is offered to the tracker. It
+            // either joins a candidate or starts one of its own.
         }
 
-        // Rules 2 and 4: the face is offered to the tracker. It either
-        // joins a candidate or starts one of its own.
         oc::FaceView view;
         view.embedding = embedding;
         view.width = 128;
@@ -95,7 +112,13 @@ public:
         view.detection_score = 0.9f;
         view.timestamp_us = nowUs;
         view.photo = {0xff, 0xd8, 0xff, 0x00, 0x7f};
-        tracker_.observe(view, nowUs);
+        const oc::AutoEnroller::Decision decision =
+            tracker_.observe(view, nowUs);
+        if (attachTo >= 0 &&
+            decision.kind ==
+                oc::AutoEnroller::Decision::Kind::CandidateStarted) {
+            attachTargets_[decision.candidate] = attachTo;
+        }
 
         commit(nowUs);
     }
@@ -139,7 +162,15 @@ private:
                 continue;
             }
 
-            const int personId = nextPersonId_++;
+            // The person the views belong to: the one they are attached
+            // to, or a new one.
+            int personId = -1;
+            const auto target = attachTargets_.find(id);
+            if (target != attachTargets_.end()) {
+                personId = target->second;
+            } else {
+                personId = nextPersonId_++;
+            }
             const std::vector<fd::FaceEntry> entries =
                 oc::makeEnrolmentEntries(*candidate, personId);
 
@@ -160,14 +191,16 @@ private:
             }
 
             tracker_.remove(id);
+            attachTargets_.erase(id);
             ++storedPeople_;
             lastPerson_ = personId;
         }
     }
 
-    oc::AutoEnroller tracker_;
     fd::FaceStore& store_;
     fd::FaceDatabase& database_;
+    std::map<int, int> attachTargets_;
+    oc::AutoEnroller tracker_;
     int nextPersonId_ = 1;
     int storedPeople_ = 0;
     int lastPerson_ = -1;
@@ -337,6 +370,76 @@ int main() {
             check(people[0].samples == 3,
                   "the person of the first run was not touched");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // A face that is probably somebody who is enrolled already is added
+    // to that person, and does not become a person of its own.
+    // ------------------------------------------------------------------
+    {
+        const std::string other = "auto_enroll_integration_other.db";
+        std::remove(other.c_str());
+
+        std::string error;
+        fd::FileFaceStore store;
+        check(store.open(other, error), "the store opens");
+
+        fd::FaceDatabase database;
+
+        // A person whose two samples are far apart: the two views of the
+        // same person, taken in two different sessions. The face in
+        // between them is not close enough to either of them to be
+        // recognised, but the person as a whole agrees with it.
+        fd::FaceEntry first;
+        first.person_id = 1;
+        first.embedding = embeddingAt(0.0);
+        fd::FaceEntry second;
+        second.person_id = 1;
+        second.embedding = embeddingAt(120.0);
+        check(store.addAll({first, second}, error),
+              "the samples of the person are written");
+        check(database.load(store),
+              "the samples are loaded into the database");
+
+        // The face in between: 1 - cos(60 deg) = 0.5 from both samples.
+        // The closest sample is at 0.5 -- too far for --face-max-distance
+        // (0.4) -- and the person as a whole is at 0.5, which is within
+        // --face-same-distance (0.6).
+        const fd::FaceDatabase::Match nearest =
+            database.match(embeddingAt(60.0), kMaxDistance);
+        check(!nearest.matched,
+              "the face is not close enough to a single sample of the person");
+        check(nearest.person_id == 1, "the closest person is the right one");
+
+        fd::PersonMatchOptions personOptions;
+        personOptions.max_distance = kSameDistance;
+        const fd::FaceDatabase::PersonMatch person =
+            database.matchPerson(embeddingAt(60.0), personOptions);
+        check(person.matched, "the person as a whole agrees with the face");
+        check(person.person_id == 1, "the right person is found");
+
+        // One view is enough for the candidate of this test.
+        oc::AutoEnroller::Options options;
+        options.target_samples = 1;
+        DeferredEnroller enroller(store, database, options);
+
+        enroller.observe(embeddingAt(60.0), 1000);
+
+        // The face was added to the person, and no person of its own was
+        // made.
+        check(enroller.storedPeople() == 1, "one person was stored");
+        check(enroller.lastPerson() == 1,
+              "the views were added to the person that was there already");
+
+        const std::vector<fd::PersonSummary> people = listPeople(store);
+        check(people.size() == 1, "the database holds one person");
+        if (people.size() == 1) {
+            check(people[0].person_id == 1, "the person keeps its id");
+            check(people[0].samples == 3,
+                  "the person has the view that was added to it");
+        }
+
+        std::remove(other.c_str());
     }
 
     std::remove(path.c_str());

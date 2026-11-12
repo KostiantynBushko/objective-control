@@ -35,6 +35,7 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
       - [What the operator sees](#what-the-operator-sees)
       - [The old behaviour (`--auto-enroll-mode=immediate`)](#the-old-behaviour---auto-enroll-modeimmediate)
       - [Enriching the people that are enrolled already (`--auto-enroll-attach`)](#enriching-the-people-that-are-enrolled-already---auto-enroll-attach)
+    - [Finding the people that were enrolled twice](#finding-the-people-that-were-enrolled-twice)
   - [Where the enrolments are stored](#where-the-enrolments-are-stored)
     - [PostgreSQL](#postgresql)
     - [The size of the face image (`--face-image-size`)](#the-size-of-the-face-image---face-image-size)
@@ -210,6 +211,11 @@ with status `0`. It needs no camera and works on its own.
 | `--face-db-list`     | *(off)*   | list the enrolled people and exit (no camera)         |
 | `--face-db-remove=<id>` | *(none)* | remove every sample of a person and exit (no camera)  |
 | `--face-db-init`     | *(off)*   | create the database schema and exit (no camera)       |
+| `--face-db-reembed`  | *(off)*   | recompute the vector of every stored face from its picture (no camera) |
+| `--face-db-merge=<from>:<to>` | *(none)* | move the samples of one or more people to another one (no camera) |
+| `--face-db-duplicates` | *(off)*  | report the people that look like one person (no camera) |
+| `--face-db-duplicates-distance=<f>` | `0.6` | distance below which two people are reported as one person |
+| `--face-db-table=<name>` | `face_enrollments` | the table of the PostgreSQL face database |
 | `--enroll=<id>`      | *(none)*  | enrol the best face of the first frame with one       |
 | `--enroll-name=<name>` | *(none)* | name of the person being enrolled; shown on screen    |
 | `--enroll-metadata=<json>` | *(none)* | extra properties of the person, as a JSON document |
@@ -223,10 +229,12 @@ with status `0`. It needs no camera and works on its own.
 | `--auto-enroll-min-size=<px>` | `64` | smallest face that is worth keeping, in pixels        |
 | `--auto-enroll-strict`   | *(off)*   | throw a face away instead of storing it with fewer views |
 | `--auto-enroll-attach`   | *(off)*   | add the views to a person that is in the database already |
+| `--auto-enroll-attach-max=<n>` | `20` | how many samples a person may hold before its views are no longer added to it |
 | `--auto-enroll-verbose`  | *(off)*   | print every view that is accepted and rejected        |
 | `--face-recognition-model=<path>` | `third_party/face-detection/models/face_recognition_sface_2021dec.onnx` | SFace model file used by `--recognize`/`--enroll` |
 | `--face-max-distance=<f>` | `0.4` | largest cosine distance still counted as a match      |
 | `--face-same-distance=<f>` | `0.6` | distance above which a face is certainly somebody new |
+| `--face-match-samples=<n>` | `3` | how many samples of a person are averaged when a face is matched against the people of the database |
 | `-h`, `--help`        | —         | print the option list and exit                         |
 
 > Every option takes its value with `=` (`--width=640`, **not** `--width 640`).
@@ -561,6 +569,7 @@ second time.
 | `--auto-enroll-min-size=<px>` | `64`    | The smallest face that is worth keeping, in pixels         |
 | `--auto-enroll-strict`        | *(off)* | Throw a face away instead of storing it with the views it has |
 | `--auto-enroll-attach`        | *(off)* | Add the views to a person that is in the database already  |
+| `--auto-enroll-attach-max`     | `20`    | How many samples a person may hold before the faces that look like it are no longer added to it. `0` means no limit |
 | `--auto-enroll-verbose`       | *(off)* | Print every view that is accepted and rejected            |
 
 A view only becomes a **view** of a candidate when it passes the gates:
@@ -661,6 +670,26 @@ picture, whatever the quality of that single frame. It is the fallback for
 a deployment that wants the old behaviour, and it is what
 `--auto-enroll-samples=1` amounts to with the quality gate in front of it.
 
+##### A face that is probably somebody who is enrolled already
+
+The camera sees a face differently every time: another pose, another
+distance, a little less light. A face that was seen in another session is
+therefore not close enough to any *single* sample of that person to be
+recognised, even though the person as a whole agrees with it.
+
+The application scores a face against the **people** of the database, not
+against the single samples: the score of a person is the mean distance to
+the few of its samples that are the closest to the face. That score is
+steadier than the distance to the closest sample, and it is what tells a
+person who was enrolled twice apart from a person who is merely unknown.
+
+A face whose score is within `--face-same-distance` is *probably*
+somebody who is in the database already. Such a face is not a person of
+its own: its views are **added to the person it belongs to**, so that the
+person gets more material to be recognised with. A person that is
+described by enough pictures does not need every sighting of it, and
+`--auto-enroll-attach-max` is where that is decided.
+
 ##### Enriching the people that are enrolled already (`--auto-enroll-attach`)
 
 A person that was enrolled by hand with a single, bad sample stays bad.
@@ -686,9 +715,16 @@ names the person to enrol, the other enrols whoever shows up.
 > the camera sees a face differently every time (another pose, another
 > distance, a little less light), and enrolling such a face again would
 > fill the database with copies of the same people. It is reported as
-> `probably <name>` and is **not** enrolled again. Lower
-> `--face-same-distance` when new people are not registered any more, raise
-> it when they are.
+> `probably <name>` and is **not** enrolled again. Its views are added to
+> that person all the same, which is what makes the person easier to
+> recognise the next time. Lower `--face-same-distance` when new people
+> are not registered any more, raise it when they are.
+>
+> `--face-match-samples` says how many samples of a person are averaged
+> when the face is matched against the people of the database. One is the
+> distance to the closest sample; more than one is steadier. Three is a
+> good compromise: it smooths the noise of a single sample without hiding
+> a person behind the others.
 
 ### Where the enrolments are stored
 
@@ -820,6 +856,59 @@ than the threshold itself. Two things help there: a camera that is closer
 to the subject, and `--face-detect-width=0`, which runs the detector at the
 resolution of the frame. The landmarks are then measured on the pixels
 themselves, and the embedding that is computed from them is steadier.
+
+#### Finding the people that were enrolled twice
+
+A face that was enrolled twice -- in two sessions, with another light and
+another distance -- ends up as two people in the database. The picture of
+a person does not tell the two apart: they look like one person, which is
+exactly why the application could not keep them together.
+
+`--face-db-duplicates` reports the people that look like one person, as
+groups: the people that are close enough to each other end up in one
+group, even when they only meet through a third one.
+
+```sh
+./build/debug/bin/objective-control-app \
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control \
+    --face-db-duplicates --face-db-duplicates-distance=0.65
+```
+
+```
+  person 1 (10 sample(s), Bushko, person 9 (1 sample(s), person 10 (3 sample(s), ...
+      person 9 is at distance 0.452 from person 1
+      person 10 is at distance 0.56 from person 1
+      person 11 is at distance 0.486 from person 1
+```
+
+The distance below which two people are reported is
+`--face-db-duplicates-distance` (`0.6` by default). It is the distance
+between the *people*, not between two of their samples: it is the mean of
+the smallest distances between the samples of the two people, which is
+steadier than the distance to a single sample.
+
+`--face-db-merge` puts the people of such a group back together. The
+rows keep their identity and the time the face was enrolled; only the
+person they belong to changes:
+
+```sh
+./build/debug/bin/objective-control-app \
+    --face-db=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control \
+    --face-db-merge=9,10,13:1
+```
+
+The "from" part may hold several ids, separated by commas. The metadata
+of the samples that are moved says where they came from, so that the
+origin of a sample is not lost:
+
+```json
+{"auto_enrolled": true, "merged_from_person_id": 9}
+```
+
+> `--face-db-table=<name>` names another table of the PostgreSQL
+> database. It is what makes it possible to look at a copy of the
+> database without touching the real one -- and to try a merge out
+> before it is done for real.
 
 #### The size of the face image (`--face-image-size`)
 

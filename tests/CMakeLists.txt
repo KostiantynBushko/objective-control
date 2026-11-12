@@ -34,6 +34,16 @@ if(OBJECTIVE_CONTROL_HAVE_FACE)
     add_test(NAME auto_enroll_integration_test
              COMMAND auto_enroll_integration_test)
 
+    # The commands of the face database: the report of the duplicates and
+    # the merge of two people. They need neither a camera nor a model.
+    if(OBJECTIVE_CONTROL_BUILD_APPS)
+        add_test(NAME face_db_cli_test
+                 COMMAND ${CMAKE_COMMAND}
+                         -DAPP=$<TARGET_FILE:objective-control-app>
+                         -DDB=${CMAKE_CURRENT_BINARY_DIR}/face_db_cli_test.db
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/face_db_cli_test.cmake)
+    endif()
+
     # The application itself: a run with --auto-enroll against a synthetic
     # camera and a file store. Nothing is written to the database, because
     # the faces of the run cannot be confirmed.

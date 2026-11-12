@@ -32,6 +32,7 @@
 #ifdef OC_HAVE_FACE
 #include "face-detection/face/database.hpp"
 #include "face-detection/face/detector.hpp"
+#include "face-detection/face/postgres_store.hpp"
 #include "face-detection/face/recognizer.hpp"
 #include "face-detection/face/store.hpp"
 #include "face-detection/json.hpp"
@@ -125,6 +126,7 @@ bool isBooleanOption(const std::string& name) {
     return name == "preview" || name == "window-fullscreen" ||
            name == "faces" || name == "recognize" || name == "help" ||
            name == "face-db-list" || name == "face-db-init" ||
+           name == "face-db-reembed" || name == "face-db-duplicates" ||
            name == "auto-enroll" || name == "auto-enroll-strict" ||
            name == "auto-enroll-attach" ||
            name == "auto-enroll-verbose";
@@ -141,12 +143,16 @@ bool isKnownOption(const std::string& name) {
         "faces",   "face-model", "face-score", "face-detect-width",
         "recognize", "enroll", "face-db", "face-recognition-model",
         "face-max-distance", "face-same-distance", "face-db-list",
-        "face-db-remove", "face-db-init", "enroll-name", "enroll-metadata",
+        "face-db-remove", "face-db-init", "face-db-reembed",
+        "face-db-table", "face-db-merge", "face-db-duplicates",
+        "face-db-duplicates-distance", "face-match-samples",
+        "enroll-name", "enroll-metadata",
         "auto-enroll", "face-image-size",
         "auto-enroll-mode", "auto-enroll-samples", "auto-enroll-window",
         "auto-enroll-timeout", "auto-enroll-consistency",
         "auto-enroll-diversity", "auto-enroll-min-size",
         "auto-enroll-strict", "auto-enroll-attach", "auto-enroll-verbose",
+        "auto-enroll-attach-max",
     };
     for (const char* known : kOptions) {
         if (name == known) {
@@ -280,6 +286,23 @@ Options:
                          --face-db; no camera is opened.
   --face-db-init         Create the database schema and exit. Needs
                          --face-db; no camera is opened.
+  --face-db-reembed      Recompute the vector of every stored face from the
+                         picture that is stored with it and write the result
+                         back. A face that was enrolled with the landmarks
+                         of a detection in the frame holds a vector that does
+                         not describe its own picture; this repairs that.
+                         Needs --face-db; no camera is opened.
+  --face-db-table=<name> Table of the PostgreSQL face database. It is
+                         face_enrollments by default; naming another one is
+                         what makes it possible to work on a copy of the
+                         database without touching the real one.
+  --face-db-merge=<from>:<to>
+                         Move the samples of one person to another one, so
+                         that a face that was enrolled twice is one person
+                         again. The "from" part may hold several ids,
+                         separated by commas (9,10,13:1). The rows keep
+                         their identity and the time they were enrolled.
+                         Needs --face-db; no camera is opened.
   --enroll=<id>          Enrol the most confident face of the first frame
                          that contains one, under this person id. Implies
                          --faces and requires --face-db.
@@ -324,6 +347,10 @@ Options:
                          (default: 64)
   --auto-enroll-strict   Throw a face away instead of storing it with the
                          views it has when the window is over
+  --auto-enroll-attach-max=<n>
+                         How many samples a person may hold before the
+                         faces that look like it are no longer added to it.
+                         0 means no limit (default: 20)
   --auto-enroll-attach   Add the collected views to a person that is
                          already in the database instead of creating a new
                          one. The views are only added while the person
@@ -343,6 +370,21 @@ Options:
                          one is probably somebody who is enrolled already,
                          so --auto-enroll leaves it alone instead of
                          enrolling the same person again (default: 0.6)
+  --face-match-samples=<n>
+                         How many samples of a person are averaged when a
+                         face is matched against the people of the
+                         database. One is the distance to the closest
+                         sample; more than one is steadier, and is what
+                         makes a person who was enrolled several times
+                         recognisable (default: 3)
+  --face-db-duplicates
+                         Report the people of the database that look like
+                         one person, so that they can be merged with
+                         --face-db-merge. Needs --face-db; no camera is
+                         opened.
+  --face-db-duplicates-distance=<f>
+                         The distance below which two people are reported
+                         as probably one person (default: 0.6)
   -h, --help             Show this help and exit
 
 Options take their value with '=' (e.g. --width=640).
@@ -709,6 +751,65 @@ bool cropFace(const cv::Mat& source, const fd::FaceBox& face, int size,
     return true;
 }
 
+// Creates the store of @p target and opens it.
+//
+// A PostgreSQL store reads the name of its table from its options, so the
+// table of --face-db-table is put in place before the store is opened. A
+// file store has no table.
+std::unique_ptr<fd::FaceStore> openFaceStore(const std::string& target,
+                                               const std::string& table,
+                                               std::string& error) {
+    auto store = fd::makeFaceStore(target, error);
+    if (!store) {
+        return nullptr;
+    }
+    if (!table.empty()) {
+        if (auto* postgres =
+                dynamic_cast<fd::PostgresFaceStore*>(store.get())) {
+            fd::PostgresFaceStore::Options options = postgres->options();
+            options.table = table;
+            postgres->setOptions(options);
+        }
+    }
+    if (!store->open(target, error)) {
+        return nullptr;
+    }
+    return store;
+}
+
+// True when the JSON document holds the given field.
+//
+// The metadata of a person is a JSON document. The library checks that a
+// document is a valid one but does not parse it, so the field is looked
+// up textually -- which is safe for the flat documents that the metadata
+// of a person holds.
+bool hasJsonField(const std::string& document, const std::string& key) {
+    return document.find("\"" + key + "\"") != std::string::npos;
+}
+
+// Adds a field to a JSON object.
+//
+// The metadata of a person is a JSON document. The library checks that a
+// document is a valid one but does not parse it, so the field is added
+// textually -- which is safe for the flat documents that the metadata of
+// a person holds.
+std::string addJsonField(const std::string& document, const std::string& key,
+                          const std::string& value) {
+    const std::string field = "\"" + key + "\": " + value;
+    if (document.empty() || document == "{}") {
+        return "{" + field + "}";
+    }
+    const std::size_t end = document.rfind('}');
+    if (end == std::string::npos) {
+        return document;
+    }
+    const std::string head = document.substr(0, end);
+    if (!head.empty() && head.back() != '{') {
+        return head + ", " + field + document.substr(end);
+    }
+    return head + field + document.substr(end);
+}
+
 // Encodes the detected face as a JPEG, so that the picture of the person
 // is stored with the enrolment. Returns an empty vector when the face
 // could not be encoded.
@@ -726,19 +827,302 @@ std::vector<std::uint8_t> encodeFace(const cv::Mat& source,
     return std::vector<std::uint8_t>(buffer.begin(), buffer.end());
 }
 
+// The face that lies on the face that was cut out.
+//
+// A cut-out of a crowded scene can hold more than one face, so the one
+// whose centre lies closest to the centre of the face that was cut out is
+// the one that belongs to it. Returns false when the cut-out holds no face
+// at all.
+bool faceInCutOut(const fd::Image& image, const fd::FaceBox& box,
+                  const fd::FaceDetector& detector, fd::FaceBox& out) {
+    const std::vector<fd::FaceBox> faces = detector.detect(image);
+    if (faces.empty()) {
+        return false;
+    }
+
+    const int centreX = box.x + box.width / 2;
+    const int centreY = box.y + box.height / 2;
+
+    const fd::FaceBox* best = nullptr;
+    long bestDistance = 0;
+    for (const fd::FaceBox& face : faces) {
+        const long dx = static_cast<long>(face.x + face.width / 2) - centreX;
+        const long dy = static_cast<long>(face.y + face.height / 2) - centreY;
+        const long distance = dx * dx + dy * dy;
+        if (best == nullptr || distance < bestDistance) {
+            best = &face;
+            bestDistance = distance;
+        }
+    }
+    if (best == nullptr) {
+        return false;
+    }
+    out = *best;
+    return true;
+}
+
 // Computes the embedding of the face at @p face.
 //
 // The face is cut out of the frame and scaled first, so that the
 // embedding is computed from the very image that is stored with the
 // enrolment: what the editor shows of a person is what was recognised.
+//
+// The landmarks that align the face are looked up in the cut-out itself
+// and not taken from the frame. The frame is searched at a reduced size
+// (--face-detect-width), so the landmarks of the frame are only precise
+// to a fraction of a pixel of the frame, and the alignment they produce
+// is off by a few pixels. SFace is very sensitive to that: two pixels of
+// landmark error already move the vector by 0.03, and eight pixels by
+// 0.2. The cut-out is the picture that is stored, and the face is bigger
+// in it than it was in the frame, so the landmarks found in it are the
+// accurate ones.
+//
+// The vector therefore depends on the stored picture alone and not on the
+// distance at which the camera happened to show the face. That is what
+// makes two sightings of the same person agree with each other -- and
+// what makes the vector of a row reproducible from the picture of that
+// row.
 bool embedFace(const cv::Mat& source, const fd::FaceBox& face, int size,
+               const fd::FaceDetector& detector,
                const fd::FaceRecognizer& recognizer,
                fd::Embedding& embedding) {
     FaceCrop crop;
     if (!cropFace(source, face, size, crop)) {
         return false;
     }
-    return recognizer.embed(toFaceImage(crop.image), crop.box, embedding);
+
+    const fd::Image image = toFaceImage(crop.image);
+
+    fd::FaceBox found;
+    if (faceInCutOut(image, crop.box, detector, found) &&
+        recognizer.embed(image, found, embedding)) {
+        return true;
+    }
+
+    // No face was found in the cut-out -- a cut-out that is too blurry,
+    // perhaps. The landmarks of the frame are used then, which is what the
+    // application did before.
+    return recognizer.embed(image, crop.box, embedding);
+}
+
+// Scores a face against the *people* of the database.
+//
+// The score of a person is the mean distance to the few of its samples
+// that are the closest to the face. That is steadier than the distance
+// to the closest sample alone: the samples of one person disagree with
+// each other -- they were taken in different sessions, with a different
+// light and a different distance -- and the closest one of them is often
+// an outlier.
+//
+// This is what tells a person who was enrolled twice apart from a person
+// who is merely unknown, and it is the score that decides whether a new
+// face belongs to somebody who is in the database already.
+fd::FaceDatabase::PersonMatch matchPerson(const fd::FaceDatabase& database,
+                                           const fd::Embedding& embedding,
+                                           float maxDistance, int samples) {
+    fd::PersonMatchOptions options;
+    options.max_distance = maxDistance;
+    options.samples = samples;
+    return database.matchPerson(embedding, options);
+}
+
+// The groups of people that look like one person.
+//
+// Two people are put in the same group when they are close enough to
+// each other. The groups are found with a union-find, so that people
+// that meet through a third one end up in the same group as well: the
+// people 1, 9 and 11 are one group even when 9 and 11 are further
+// apart than 1 and 9.
+//
+// The groups are returned in the order of their first member, and the
+// members of a group are in the order of the people.
+std::vector<std::vector<int>> duplicateGroups(
+    const fd::FaceDatabase& database,
+    const std::vector<fd::FaceDatabase::PersonInfo>& people, float threshold,
+    int samples) {
+    std::vector<int> parent(people.size());
+    for (std::size_t i = 0; i < parent.size(); ++i) {
+        parent[i] = static_cast<int>(i);
+    }
+
+    // The root of a person is the person itself, or the root of the
+    // group it was put in.
+    const auto root = [&parent](int index) {
+        int current = index;
+        while (parent[static_cast<std::size_t>(current)] != current) {
+            current = parent[static_cast<std::size_t>(current)];
+        }
+        // The path to the root is shortened, so that the search stays
+        // short even for a long chain.
+        int walk = index;
+        while (parent[static_cast<std::size_t>(walk)] != current) {
+            const int next = parent[static_cast<std::size_t>(walk)];
+            parent[static_cast<std::size_t>(walk)] = current;
+            walk = next;
+        }
+        return current;
+    };
+
+    for (std::size_t i = 0; i < people.size(); ++i) {
+        for (std::size_t j = i + 1; j < people.size(); ++j) {
+            const float distance =
+                database.personDistance(people[i].person_id,
+                                        people[j].person_id, samples);
+            if (distance > threshold) {
+                continue;
+            }
+            const int left = root(static_cast<int>(i));
+            const int right = root(static_cast<int>(j));
+            if (left != right) {
+                parent[static_cast<std::size_t>(left)] = right;
+            }
+        }
+    }
+
+    // The groups, in the order of their first member.
+    std::vector<int> order;
+    std::vector<std::vector<int>> groups;
+    for (std::size_t i = 0; i < people.size(); ++i) {
+        const int leader = root(static_cast<int>(i));
+        auto it = std::find(order.begin(), order.end(), leader);
+        if (it == order.end()) {
+            order.push_back(leader);
+            groups.push_back({static_cast<int>(i)});
+            continue;
+        }
+        groups[static_cast<std::size_t>(it - order.begin())].push_back(
+            static_cast<int>(i));
+    }
+
+    // The groups of one person alone are not duplicates.
+    std::vector<std::vector<int>> result;
+    for (const std::vector<int>& group : groups) {
+        if (group.size() > 1) {
+            result.push_back(group);
+        }
+    }
+    return result;
+}
+
+// The name of a person, looked up among all of its samples.
+//
+// The name belongs to the person and not to the sample that happened to
+// be the closest one, so it is looked up the same way the stores look it
+// up.
+std::string nameOfPerson(const fd::FaceDatabase& database, int person_id) {
+    std::string name;
+    for (const fd::FaceEntry& entry : database.entries()) {
+        if (entry.person_id != person_id || entry.info.user_name.empty()) {
+            continue;
+        }
+        if (name.empty() || entry.info.user_name > name) {
+            name = entry.info.user_name;
+        }
+    }
+    return name;
+}
+
+// The metadata of a person, looked up among all of its samples.
+//
+// The metadata belongs to the person and not to the sample that happened
+// to be the closest one, so it is looked up the same way the name is.
+std::string metadataOfPerson(const fd::FaceDatabase& database, int person_id) {
+    std::string metadata;
+    for (const fd::FaceEntry& entry : database.entries()) {
+        if (entry.person_id != person_id || entry.info.metadata.empty()) {
+            continue;
+        }
+        // The first sample of the person decides, the same way the editor
+        // shows it.
+        metadata = entry.info.metadata;
+        break;
+    }
+    return metadata;
+}
+
+// Recomputes the vector of every sample that has a picture.
+//
+// The vector of a sample is what the recogniser computed for the picture
+// that is stored next to it. A sample that was enrolled with the
+// landmarks of a detection in the frame holds a vector that does not
+// describe the picture next to it, and it cannot be reproduced from it.
+// That is what this repairs: the picture is decoded, the face is looked up
+// in the picture itself, and the vector is computed again. The vector
+// then depends on the picture alone, which is what makes two sightings of
+// the same person agree with each other.
+//
+// The samples that have no picture, or whose picture holds no face, are
+// left alone -- there is nothing to compute a vector from.
+//
+// Returns the number of samples whose vector was rewritten.
+int reembedEntries(const std::vector<fd::FaceEntry>& entries,
+                   std::vector<fd::FaceEntry>& out,
+                   const fd::FaceDetector& detector,
+                   const fd::FaceRecognizer& recognizer,
+                   std::ostream& report) {
+    out = entries;
+    int rewritten = 0;
+    for (fd::FaceEntry& entry : out) {
+        if (entry.info.photo.empty()) {
+            report << "  person " << entry.person_id
+                   << ": no picture, the vector is left alone\n";
+            continue;
+        }
+
+        const cv::Mat picture =
+            cv::imdecode(entry.info.photo, cv::IMREAD_COLOR);
+        if (picture.empty()) {
+            report << "  person " << entry.person_id
+                   << ": the picture could not be read, the vector is left "
+                      "alone\n";
+            continue;
+        }
+
+        fd::Image image;
+        image.width = picture.cols;
+        image.height = picture.rows;
+        image.channels = 3;
+        image.data.assign(picture.datastart, picture.dataend);
+
+        // The picture is the cut-out of one face, so the face is the one
+        // in the middle of it. A cut-out of a crowded scene can hold more
+        // than one face, and the middle one is the one that was cut out.
+        const std::vector<fd::FaceBox> faces = detector.detect(image);
+        if (faces.empty()) {
+            report << "  person " << entry.person_id
+                   << ": no face in the picture, the vector is left alone\n";
+            continue;
+        }
+        const int centreX = picture.cols / 2;
+        const int centreY = picture.rows / 2;
+        const fd::FaceBox* face = &faces.front();
+        long bestDistance = 0;
+        for (const fd::FaceBox& candidate : faces) {
+            const long dx = static_cast<long>(candidate.x + candidate.width / 2) -
+                            centreX;
+            const long dy = static_cast<long>(candidate.y + candidate.height / 2) -
+                            centreY;
+            const long distance = dx * dx + dy * dy;
+            if (&candidate == &faces.front() || distance < bestDistance) {
+                face = &candidate;
+                bestDistance = distance;
+            }
+        }
+
+        fd::Embedding embedding;
+        if (!recognizer.embed(image, *face, embedding)) {
+            report << "  person " << entry.person_id
+                   << ": the vector could not be computed, it is left alone\n";
+            continue;
+        }
+
+        const float moved = entry.embedding.cosineDistance(embedding);
+        entry.embedding = embedding;
+        ++rewritten;
+        report << "  person " << entry.person_id << ": the vector moved by "
+               << formatDistance(moved) << '\n';
+    }
+    return rewritten;
 }
 
 // Draws a box and a caption for every detected face. A recognised person
@@ -893,6 +1277,84 @@ int main(int argc, char** argv) {
     const std::string faceDbPath = arg(argc, argv, "face-db", "");
     const bool faceDbList = flag(argc, argv, "face-db-list");
     const bool faceDbInit = flag(argc, argv, "face-db-init");
+    const bool faceDbReembed = flag(argc, argv, "face-db-reembed");
+    const bool faceDbDuplicates = flag(argc, argv, "face-db-duplicates");
+
+    // The distance below which two people are reported as probably one
+    // person.
+    const double faceDbDuplicatesDistance =
+        std::atof(arg(argc, argv, "face-db-duplicates-distance", "0.6")
+                      .c_str());
+
+    // The table of the PostgreSQL store. It is "face_enrollments" by
+    // default; naming another one is what makes it possible to work on a
+    // copy of the database without touching the real one.
+    const std::string faceDbTable = arg(argc, argv, "face-db-table", "");
+
+    // --face-db-merge=<from>:<to> moves the samples of one person to
+    // another one. The "from" part may hold several ids, separated by
+    // commas: --face-db-merge=9,10,13:1 moves three people to one.
+    const std::string faceDbMergeStr = arg(argc, argv, "face-db-merge", "");
+    std::vector<int> faceDbMergeFrom;
+    int faceDbMergeTo = -1;
+    if (!faceDbMergeStr.empty()) {
+        const std::size_t colon = faceDbMergeStr.find(':');
+        const std::string invalid =
+            "Invalid --face-db-merge value '" + faceDbMergeStr +
+            "' (expected <from>:<to>, e.g. 24:1 or 9,10,13:1).\n";
+        if (colon == std::string::npos) {
+            std::cerr << invalid;
+            return 2;
+        }
+        try {
+            faceDbMergeTo = std::stoi(faceDbMergeStr.substr(colon + 1));
+        } catch (const std::exception&) {
+            std::cerr << invalid;
+            return 2;
+        }
+        if (faceDbMergeTo < 0) {
+            std::cerr << "Invalid --face-db-merge value '" << faceDbMergeStr
+                      << "' (the ids of the people are not negative).\n";
+            return 2;
+        }
+
+        // The ids of the people whose samples are moved.
+        const std::string from = faceDbMergeStr.substr(0, colon);
+        std::size_t start = 0;
+        while (start <= from.size()) {
+            const std::size_t comma = from.find(',', start);
+            const std::string part = from.substr(
+                start, comma == std::string::npos ? std::string::npos
+                                                  : comma - start);
+            if (part.empty()) {
+                std::cerr << invalid;
+                return 2;
+            }
+            int id = -1;
+            try {
+                id = std::stoi(part);
+            } catch (const std::exception&) {
+                std::cerr << invalid;
+                return 2;
+            }
+            if (id < 0) {
+                std::cerr << "Invalid --face-db-merge value '"
+                          << faceDbMergeStr
+                          << "' (the ids of the people are not negative).\n";
+                return 2;
+            }
+            if (id == faceDbMergeTo) {
+                std::cerr << "Nothing to merge: --face-db-merge names the "
+                             "same person twice.\n";
+                return 2;
+            }
+            faceDbMergeFrom.push_back(id);
+            if (comma == std::string::npos) {
+                break;
+            }
+            start = comma + 1;
+        }
+    }
     const std::string faceDbRemoveStr = arg(argc, argv, "face-db-remove", "");
     const std::string faceRecModel = arg(argc, argv, "face-recognition-model",
                                          "third_party/face-detection/models/"
@@ -907,6 +1369,20 @@ int main(int argc, char** argv) {
     // not enrolled a second time.
     double sameDistance =
         std::atof(arg(argc, argv, "face-same-distance", "0.6").c_str());
+
+    // How many samples of a person are averaged when a face is matched
+    // against the people of the database. One is the distance to the
+    // closest sample; more than one is steadier, and is what makes a
+    // person who was enrolled several times recognisable.
+    int faceMatchSamples = 3;
+    {
+        const std::string value = arg(argc, argv, "face-match-samples", "3");
+        if (!parseInteger(value, faceMatchSamples) || faceMatchSamples < 1) {
+            std::cerr << "Invalid --face-match-samples value '" << value
+                      << "' (expected a number of samples, at least 1).\n";
+            return 2;
+        }
+    }
     if (sameDistance <= maxDistance) {
         std::cerr << "Ignoring --face-same-distance=" << sameDistance
                   << ": it has to be larger than --face-max-distance ("
@@ -1060,6 +1536,23 @@ int main(int argc, char** argv) {
 
     const bool autoEnrollStrict = flag(argc, argv, "auto-enroll-strict");
     const bool autoEnrollAttach = flag(argc, argv, "auto-enroll-attach");
+
+    // How many samples a person may hold before the faces that look like
+    // it are no longer added to it. A person that is described by a
+    // handful of good pictures does not need every sighting of it, and a
+    // database that grows without a limit is a database nobody can look
+    // at. Zero means no limit.
+    int autoEnrollAttachMax = 20;
+    {
+        const std::string value =
+            arg(argc, argv, "auto-enroll-attach-max", "20");
+        if (!parseInteger(value, autoEnrollAttachMax) ||
+            autoEnrollAttachMax < 0) {
+            std::cerr << "Invalid --auto-enroll-attach-max value '" << value
+                      << "' (expected a number of samples, 0 for no limit).\n";
+            return 2;
+        }
+    }
     const bool autoEnrollVerbose = flag(argc, argv, "auto-enroll-verbose");
 
 #ifdef OC_HAVE_FACE
@@ -1137,24 +1630,25 @@ int main(int argc, char** argv) {
     // Listing, removing and initialising the database do not need a camera,
     // so they are handled before one is opened.
     const bool dbAdmin =
-        faceDbList || faceDbInit || faceDbRemoveId >= 0;
+        faceDbList || faceDbInit || faceDbRemoveId >= 0 || faceDbReembed ||
+        faceDbDuplicates || !faceDbMergeFrom.empty();
     if (dbAdmin) {
 #ifdef OC_HAVE_FACE
         if (faceDbTarget.empty()) {
-            std::cerr << "--face-db-list, --face-db-init and "
-                         "--face-db-remove need --face-db=<target>.\n";
+            std::cerr << "--face-db-list, --face-db-init, --face-db-remove, "
+                         "--face-db-reembed, --face-db-duplicates and "
+                         "--face-db-merge need --face-db=<target>.\n";
             return 2;
         }
 
         std::string error;
-        auto store = fd::makeFaceStore(faceDbTarget, error);
+        auto store = openFaceStore(faceDbTarget, faceDbTable, error);
         if (!store) {
-            std::cerr << error << '\n';
-            return 1;
-        }
-        if (!store->open(faceDbTarget, error)) {
-            std::cerr << "Could not open the face database '" << faceDbTarget
-                      << "': " << error << '\n';
+            std::cerr << (error.empty()
+                              ? std::string("Could not open the face "
+                                            "database '") + faceDbTarget + "'."
+                              : error)
+                      << '\n';
             return 1;
         }
         warnAboutMissingProperties(*store);
@@ -1192,6 +1686,248 @@ int main(int argc, char** argv) {
             return 0;
         }
 
+        // --face-db-merge=<from>:<to>: the samples of one or more people
+        // are moved to another one. The rows keep their identity and the
+        // time the face was enrolled; only the person they belong to
+        // changes.
+        if (!faceDbMergeFrom.empty()) {
+            std::vector<fd::FaceEntry> entries;
+            if (!store->load(entries, error)) {
+                std::cerr << "Could not read the face database: " << error
+                          << '\n';
+                return 1;
+            }
+
+            // The name of the person: the one of the target, or the one of
+            // a source when the target does not have a name.
+            std::string name;
+            for (const fd::FaceEntry& entry : entries) {
+                if (entry.person_id == faceDbMergeTo &&
+                    !entry.info.user_name.empty()) {
+                    name = entry.info.user_name;
+                    break;
+                }
+            }
+            if (name.empty()) {
+                for (const int from : faceDbMergeFrom) {
+                    for (const fd::FaceEntry& entry : entries) {
+                        if (entry.person_id == from &&
+                            !entry.info.user_name.empty()) {
+                            name = entry.info.user_name;
+                            break;
+                        }
+                    }
+                    if (!name.empty()) {
+                        break;
+                    }
+                }
+            }
+
+            // The people whose samples are moved.
+            const auto isSource = [&faceDbMergeFrom](int person_id) {
+                return std::find(faceDbMergeFrom.begin(), faceDbMergeFrom.end(),
+                                 person_id) != faceDbMergeFrom.end();
+            };
+
+            int moved = 0;
+            int kept = 0;
+            std::vector<fd::FaceEntry> changed;
+            for (fd::FaceEntry& entry : entries) {
+                if (entry.person_id != faceDbMergeTo && !isSource(entry.person_id)) {
+                    continue;
+                }
+                if (isSource(entry.person_id)) {
+                    // The metadata of a person says where it came from,
+                    // so that the origin of the samples is not lost. A
+                    // sample that was moved before keeps the id it came
+                    // from: that is the more useful of the two.
+                    if (!hasJsonField(entry.info.metadata,
+                                      "merged_from_person_id")) {
+                        entry.info.metadata = addJsonField(
+                            entry.info.metadata, "merged_from_person_id",
+                            std::to_string(entry.person_id));
+                    }
+                    entry.person_id = faceDbMergeTo;
+                    ++moved;
+                } else {
+                    ++kept;
+                }
+                // The name and the metadata are properties of the person,
+                // so every sample of the person carries them.
+                entry.info.user_name = name;
+                changed.push_back(entry);
+            }
+
+            if (moved == 0) {
+                std::cerr << "None of the people of --face-db-merge is in "
+                          << faceDbTarget << ".\n";
+                return 1;
+            }
+
+            if (!store->update(changed, error)) {
+                std::cerr << "Could not write the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            std::cout << "Moved " << moved << " sample(s) to person "
+                      << faceDbMergeTo << " (" << kept
+                      << " sample(s) were there already).\n";
+            return 0;
+        }
+
+        // --face-db-duplicates: the people that look like one person.
+        //
+        // A face that was enrolled twice -- in two sessions, with another
+        // light and another distance -- ends up as two people in the
+        // database. The report lists the pairs of people that are close
+        // enough to be the same person, so that they can be merged with
+        // --face-db-merge.
+        if (faceDbDuplicates) {
+            // A database that holds nobody has no duplicates. The list
+            // is asked first, because it answers for a database that does
+            // not exist yet, while the load does not.
+            std::vector<fd::PersonSummary> summaries;
+            if (!store->list(summaries, error)) {
+                std::cerr << "Could not read the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            if (summaries.empty()) {
+                std::cout << "No two people of " << faceDbTarget
+                          << " look like one person (distance below "
+                          << faceDbDuplicatesDistance << ").\n";
+                return 0;
+            }
+
+            std::vector<fd::FaceEntry> entries;
+            if (!store->load(entries, error)) {
+                std::cerr << "Could not read the face database: " << error
+                          << '\n';
+                return 1;
+            }
+
+            fd::FaceDatabase database;
+            for (const fd::FaceEntry& entry : entries) {
+                database.add(entry);
+            }
+
+            const auto describe = [](const fd::FaceDatabase::PersonInfo& info) {
+                std::string text = "person " + std::to_string(info.person_id) +
+                                   " (" + std::to_string(info.samples) +
+                                   " sample(s)";
+                if (!info.user_name.empty()) {
+                    text += ", " + info.user_name;
+                }
+                return text;
+            };
+
+            const std::vector<fd::FaceDatabase::PersonInfo> people =
+                database.people();
+            const std::vector<std::vector<int>> groups = duplicateGroups(
+                database, people, static_cast<float>(faceDbDuplicatesDistance),
+                faceMatchSamples);
+
+            for (const std::vector<int>& group : groups) {
+                std::cout << "  ";
+                for (std::size_t k = 0; k < group.size(); ++k) {
+                    if (k > 0) {
+                        std::cout << ", ";
+                    }
+                    std::cout << describe(people[static_cast<std::size_t>(
+                        group[k])]);
+                }
+                std::cout << "\n";
+
+                // The distance of every member of the group to the first
+                // one, so that the operator can see how sure the group is.
+                for (std::size_t k = 1; k < group.size(); ++k) {
+                    const float distance = database.personDistance(
+                        people[static_cast<std::size_t>(group[0])].person_id,
+                        people[static_cast<std::size_t>(group[k])].person_id,
+                        faceMatchSamples);
+                    std::cout << "      person "
+                              << people[static_cast<std::size_t>(group[k])]
+                                     .person_id
+                              << " is at distance " << formatDistance(distance)
+                              << " from person "
+                              << people[static_cast<std::size_t>(group[0])]
+                                     .person_id
+                              << "\n";
+                }
+            }
+
+            if (groups.empty()) {
+                std::cout << "No two people of " << faceDbTarget
+                          << " look like one person (distance below "
+                          << faceDbDuplicatesDistance << ").\n";
+            } else {
+                std::cout << groups.size() << " group(s) of " << faceDbTarget
+                          << " look like one person (distance below "
+                          << faceDbDuplicatesDistance
+                          << "). Merge them with --face-db-merge.\n";
+            }
+            return 0;
+        }
+
+        // --face-db-reembed: the vectors are computed again from the
+        // pictures that are stored with them.
+        if (faceDbReembed) {
+#ifdef OC_HAVE_OPENCV
+            fd::FaceDetector detector;
+            fd::FaceDetector::Options detectorOptions;
+            detectorOptions.model_path = faceModel;
+            detectorOptions.score_threshold = static_cast<float>(faceScore);
+            detectorOptions.detection_width = faceDetectWidth;
+            if (!detector.open(detectorOptions)) {
+                std::cerr << "Could not load the face-detection model '"
+                          << faceModel << "'.\n";
+                return 1;
+            }
+
+            fd::FaceRecognizer recognizer;
+            fd::FaceRecognizer::Options recognizerOptions;
+            recognizerOptions.model_path = faceRecModel;
+            if (!recognizer.open(recognizerOptions)) {
+                std::cerr << "Could not load the face-recognition model '"
+                          << faceRecModel << "'.\n";
+                return 1;
+            }
+
+            std::vector<fd::FaceEntry> entries;
+            if (!store->load(entries, error)) {
+                std::cerr << "Could not read the face database: " << error
+                          << '\n';
+                return 1;
+            }
+            if (entries.empty()) {
+                std::cout << "There is nothing to repair in " << faceDbTarget
+                          << ".\n";
+                return 0;
+            }
+
+            std::vector<fd::FaceEntry> repaired;
+            const int rewritten =
+                reembedEntries(entries, repaired, detector, recognizer,
+                               std::cout);
+            if (rewritten > 0) {
+                // The rows are changed in place, so that they keep their
+                // identity and the time the face was enrolled.
+                if (!store->update(repaired, error)) {
+                    std::cerr << "Could not write the face database: " << error
+                              << '\n';
+                    return 1;
+                }
+            }
+            std::cout << "Rewrote " << rewritten << " vector(s) out of "
+                      << entries.size() << " sample(s) in " << faceDbTarget
+                      << ".\n";
+            return 0;
+#else
+            std::cerr << "--face-db-reembed needs a build with OpenCV.\n";
+            return 1;
+#endif
+        }
+
         // --face-db-init: a PostgreSQL store creates its schema here; a
         // file store gets an empty database file.
         if (fd::isPostgresTarget(faceDbTarget)) {
@@ -1216,8 +1952,9 @@ int main(int argc, char** argv) {
         }
         return 0;
 #else
-        std::cerr << "--face-db-list, --face-db-init and --face-db-remove "
-                     "require a build with OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
+        std::cerr << "--face-db-list, --face-db-init, --face-db-remove and "
+                     "--face-db-reembed require a build with "
+                     "OBJECTIVE_CONTROL_ENABLE_FACE=ON.\n";
         return 1;
 #endif
     }
@@ -1286,15 +2023,14 @@ int main(int argc, char** argv) {
         // frame.
         if (!faceDbTarget.empty()) {
             std::string error;
-            faceStore = fd::makeFaceStore(faceDbTarget, error);
+            faceStore = openFaceStore(faceDbTarget, faceDbTable, error);
             if (!faceStore) {
-                std::cerr << error << '\n';
-                camera->close();
-                return 1;
-            }
-            if (!faceStore->open(faceDbTarget, error)) {
-                std::cerr << "Could not open the face database '"
-                          << faceDbTarget << "': " << error << '\n';
+                std::cerr << (error.empty()
+                                  ? std::string("Could not open the face "
+                                                "database '") + faceDbTarget +
+                                        "'."
+                                  : error)
+                          << '\n';
                 camera->close();
                 return 1;
             }
@@ -1468,7 +2204,18 @@ int main(int argc, char** argv) {
         // Somebody else may have enrolled the same person in the
         // meantime: the views are matched against the database one last
         // time, so that a person is not stored twice.
+        //
+        // Two questions are asked. The first one -- the closest sample -- is
+        // strict: the face *is* the person of that sample. The second one --
+        // the person-level score -- is forgiving: the face looks like that
+        // person, even though no single sample of that person matches it as
+        // well as the threshold demands. That is the case when the person
+        // was enrolled in another session, with another light and another
+        // distance, and it is exactly the case that used to enrol somebody
+        // who was in the database already a second time.
         int existing = -1;
+        int probable = -1;
+        float probableDistance = 1.0f;
         for (const oc::FaceView& view : candidate.views) {
             const fd::FaceDatabase::Match match = faceDatabase.match(
                 view.embedding, static_cast<float>(maxDistance));
@@ -1476,10 +2223,17 @@ int main(int argc, char** argv) {
                 existing = match.person_id;
                 break;
             }
+            const fd::FaceDatabase::PersonMatch person = matchPerson(
+                faceDatabase, view.embedding, static_cast<float>(sameDistance),
+                faceMatchSamples);
+            if (person.matched && person.distance < probableDistance) {
+                probable = person.person_id;
+                probableDistance = person.distance;
+            }
         }
 
         const auto target = attachTargets.find(candidateId);
-        const bool attaches = target != attachTargets.end();
+        bool attaches = target != attachTargets.end();
 
         if (existing >= 0 && !attaches) {
             // The person is in the database already, so the candidate is
@@ -1499,6 +2253,14 @@ int main(int argc, char** argv) {
             personId = target->second;
         } else if (existing >= 0) {
             personId = existing;
+        } else if (probable >= 0) {
+            // The views look like somebody who is in the database already.
+            // They are added to that person instead of enrolling a second
+            // person: the person gets more material to be recognised with,
+            // and the database does not fill up with copies of the same
+            // people.
+            personId = probable;
+            attaches = true;
         } else {
             const auto known = candidateIds.find(candidateId);
             if (known != candidateIds.end()) {
@@ -1514,8 +2276,32 @@ int main(int argc, char** argv) {
 
         // The samples of the person: one row per view, with the metadata
         // of the person on every one of them.
-        const std::vector<fd::FaceEntry> entries =
+        std::vector<fd::FaceEntry> entries =
             oc::makeEnrolmentEntries(candidate, personId);
+
+        // The name of the person belongs to the person, so every sample
+        // of the person carries it -- the samples that are added to a
+        // person that is in the database already included.
+        const std::string name = nameOfPerson(faceDatabase, personId);
+        if (!name.empty()) {
+            for (fd::FaceEntry& entry : entries) {
+                entry.info.user_name = name;
+            }
+        }
+
+        // The same goes for the metadata: it is a property of the
+        // person, so the samples that are added to a person that is in
+        // the database already carry the metadata of that person and
+        // not the metadata of the candidate.
+        if (attaches) {
+            const std::string metadata =
+                metadataOfPerson(faceDatabase, personId);
+            if (!metadata.empty()) {
+                for (fd::FaceEntry& entry : entries) {
+                    entry.info.metadata = metadata;
+                }
+            }
+        }
 
         // The views are written in one go: the store writes the samples of
         // one person in one transaction (PostgreSQL) or in one rewrite
@@ -1718,6 +2504,14 @@ int main(int argc, char** argv) {
                 embedding, static_cast<float>(maxDistance));
             result.distance = match.distance;
 
+            // The same face, scored against the *people* of the database
+            // rather than against the single samples. It is the score
+            // that recognises a person who was enrolled in another
+            // session, where no single sample is close enough.
+            const fd::FaceDatabase::PersonMatch person = matchPerson(
+                faceDatabase, embedding, static_cast<float>(sameDistance),
+                faceMatchSamples);
+
             // ---------------- Rule 1: the face is in the database ----------------
             if (match.matched) {
                 // The face is in the database already. Nothing is stored
@@ -1751,11 +2545,10 @@ int main(int argc, char** argv) {
                 // A second enrolment of somebody who is enrolled already
                 // would fill the database with copies of them, so such a
                 // face is reported and left alone.
-                if (autoEnroll && faceStore && match.person_id >= 0 &&
-                    match.distance <= sameDistance) {
+                if (autoEnroll && faceStore && person.matched) {
                     result.probable = true;
-                    result.person_id = match.person_id;
-                    result.user_name = match.user_name;
+                    result.person_id = person.person_id;
+                    result.user_name = person.user_name;
                     results.push_back(result);
                     continue;
                 }
@@ -1812,14 +2605,36 @@ int main(int argc, char** argv) {
 
             if (owner == nullptr) {
                 // Rule 3: the face is close to somebody who is enrolled
-                // already, but it is not that person. Such a face is
-                // reported and left alone, and no candidate is started for
-                // it.
-                if (faceStore && match.person_id >= 0 &&
-                    match.distance <= sameDistance) {
+                // already, but it is not that person.
+                //
+                // The face is watched all the same, and its views are
+                // added to that person. A face that is probably somebody
+                // who is enrolled already is exactly the material that
+                // person needs: the camera sees a face differently every
+                // time, and a person is only recognised from the
+                // pictures that are in the database. Dropping those faces
+                // is what left the database with a handful of samples per
+                // person -- and what filled it with copies of the same
+                // people.
+                if (faceStore && person.matched) {
                     result.probable = true;
-                    result.person_id = match.person_id;
-                    result.user_name = match.user_name;
+                    result.person_id = person.person_id;
+                    result.user_name = person.user_name;
+
+                    // A person that is described by enough pictures does
+                    // not need every sighting of it.
+                    if (autoEnrollAttachMax == 0 ||
+                        sampleCounts[person.person_id] < autoEnrollAttachMax) {
+                        const oc::AutoEnroller::Decision decision =
+                            observeFace(face, embedding, nullptr, 0.0f,
+                                        pictureOf, nowUs, result, notes);
+                        if (decision.kind ==
+                            oc::AutoEnroller::Decision::Kind::
+                                CandidateStarted) {
+                            attachTargets[decision.candidate] =
+                                person.person_id;
+                        }
+                    }
                     results.push_back(result);
                     continue;
                 }
@@ -1851,8 +2666,8 @@ int main(int argc, char** argv) {
                 if (!faceRecognizer) {
                     return false;
                 }
-                return embedFace(image, box, faceImageSize, *faceRecognizer,
-                                 embedding);
+                return embedFace(image, box, faceImageSize, *faceDetector,
+                                 *faceRecognizer, embedding);
             },
             notes);
 
@@ -2112,8 +2927,8 @@ int main(int argc, char** argv) {
                 if (!toMat(*frame, view) || !faceRecognizer) {
                     return false;
                 }
-                return embedFace(view, box, faceImageSize, *faceRecognizer,
-                                 embedding);
+                return embedFace(view, box, faceImageSize, *faceDetector,
+                                 *faceRecognizer, embedding);
             };
 #endif
 
@@ -2232,9 +3047,29 @@ int main(int argc, char** argv) {
                                      "keep " << what << ")";
                     };
 
+                    // The embedding is computed from the cut-out, the way
+                    // the automatic enrolment computes it, so that a face
+                    // that is enrolled by hand and a face that is enrolled
+                    // automatically are recognised the same way.
+                    fd::Embedding embedding;
+                    bool embedded = false;
+#ifdef OC_HAVE_OPENCV
+                    {
+                        cv::Mat view;
+                        if (toMat(*frame, view) && faceDetector) {
+                            embedded = embedFace(view, box, faceImageSize,
+                                                 *faceDetector, *faceRecognizer,
+                                                 embedding);
+                        }
+                    }
+#endif
+                    if (!embedded) {
+                        embedded = faceRecognizer->embed(image, box, embedding);
+                    }
+
                     fd::FaceEntry entry;
-                    if (faceDatabase.enroll(enrollId, image, box,
-                                            *faceRecognizer, info, &entry)) {
+                    if (embedded &&
+                        faceDatabase.enroll(enrollId, embedding, info, &entry)) {
                         enrolled = true;
                         std::cout << "  Enrolled person " << enrollId << " ("
                                   << faceDatabase.size()
