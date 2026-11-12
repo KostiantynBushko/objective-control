@@ -28,7 +28,7 @@ enrols somebody.
 
 Run it with::
 
-    python3 face_db_editor.py --dsn=postgres://user@localhost/objective_control
+    python3 face_db_editor.py --dsn=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 
 The connection string is taken from ``--dsn``, else from ``$FACE_DB_URL``,
 else from ``$DATABASE_URL`` -- the same order the C++ application uses.
@@ -955,7 +955,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         metavar="CONNECTION",
         help=(
             "the PostgreSQL database to open, e.g. "
-            "postgres://user@localhost/objective_control. Taken from $FACE_DB_URL "
+            "postgres://objective_control:objective_control@127.0.0.1:5432/objective_control. Taken from $FACE_DB_URL "
             "or $DATABASE_URL when it is not given."
         ),
     )

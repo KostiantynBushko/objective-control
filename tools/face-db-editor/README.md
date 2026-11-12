@@ -41,7 +41,7 @@ session.
 pip install -r requirements.txt
 
 python3 tools/face-db-editor/face_db_editor.py \
-    --dsn='postgres://user@localhost/objective_control'
+    --dsn='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
 ```
 
 The connection string is taken from `--dsn`, else from `$FACE_DB_URL`,
@@ -49,7 +49,7 @@ else from `$DATABASE_URL` -- the same order the C++ application looks
 them up in:
 
 ```sh
-export FACE_DB_URL='postgres://user@localhost/objective_control'
+export FACE_DB_URL='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
 python3 tools/face-db-editor/face_db_editor.py
 ```
 

@@ -13,11 +13,11 @@ to, because that is the table of the installation.
 
 Run it with::
 
-    python3 seed_demo_data.py --dsn=postgres://user@localhost/objective_control
+    python3 seed_demo_data.py --dsn=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control
 
 and then open the editor on the table it names::
 
-    python3 face_db_editor.py --dsn=postgres://user@localhost/objective_control \\
+    python3 face_db_editor.py --dsn=postgres://objective_control:objective_control@127.0.0.1:5432/objective_control \\
         --table=face_enrollments_demo
 """
 
@@ -148,7 +148,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="CONNECTION",
         help=(
             "the PostgreSQL database to write to, e.g. "
-            "postgres://user@localhost/objective_control. Taken from "
+            "postgres://objective_control:objective_control@127.0.0.1:5432/objective_control. Taken from "
             "$FACE_DB_URL or $DATABASE_URL when it is not given."
         ),
     )

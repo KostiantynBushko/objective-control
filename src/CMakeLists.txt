@@ -41,6 +41,15 @@ if(OC_HAVE_OPENCV OR OC_HAVE_FFMPEG)
     target_sources(objective_control PRIVATE backends/ip_camera.cpp)
 endif()
 
+# The tracker of the faces that are not in the database yet. It needs the
+# embeddings of the face-detection submodule, so it is only built when that
+# submodule is used.
+if(OBJECTIVE_CONTROL_HAVE_FACE)
+    target_sources(objective_control PRIVATE
+        face/auto_enroller.cpp
+    )
+endif()
+
 # GStreamer backend (future).
 if(OC_HAVE_GSTREAMER)
     target_compile_definitions(objective_control PUBLIC OC_HAVE_GSTREAMER=1)
