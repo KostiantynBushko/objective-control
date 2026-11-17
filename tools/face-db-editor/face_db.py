@@ -54,6 +54,7 @@ __all__ = [
     "format_metadata",
     "is_postgres_dsn",
     "parse_metadata",
+    "sniff_image_format",
 ]
 
 #: The table the C++ store writes to by default.
@@ -204,6 +205,24 @@ def format_embedding(values: Sequence[float]) -> str:
 def embedding_as_json(values: Sequence[float]) -> str:
     """The embedding as a JSON array, ready to be pasted somewhere else."""
     return json.dumps([float(value) for value in values])
+
+
+def sniff_image_format(data: bytes) -> str:
+    """Returns the format of an encoded image: "jpeg", "png" or "unknown".
+
+    The picture of a face is stored as the bytes of an encoded image, and
+    the C++ application writes a JPEG. The editor has to know, because
+    the extension of the file the user saves should match what is in it.
+
+    The function lives here and not in the editor, because the web
+    version of the editor needs it as well and this module is free of
+    any GUI code.
+    """
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    return "unknown"
 
 
 class FaceStore:

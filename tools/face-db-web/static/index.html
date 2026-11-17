@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Face database editor</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header class="bar">
+  <span class="bar-title">Face database editor</span>
+  <span class="bar-field">
+    <label for="dsn">Database:</label>
+    <span id="dsn" class="bar-value">&mdash;</span>
+  </span>
+  <span class="bar-field">
+    <label for="table">Table:</label>
+    <span id="table" class="bar-value">&mdash;</span>
+  </span>
+  <span id="connection" class="pill pill-off">not connected</span>
+  <span class="bar-spacer"></span>
+  <button id="connect" class="button">Connect</button>
+  <button id="disconnect" class="button button-quiet">Disconnect</button>
+</header>
+
+<div id="warning" class="warning" hidden></div>
+
+<main class="layout">
+
+  <section class="pane pane-people">
+    <h2 class="pane-title">People</h2>
+    <input id="filter" class="filter" type="search" placeholder="Filter by id or name"
+           autocomplete="off" spellcheck="false">
+    <div class="table-wrap">
+      <table class="grid" id="people-table">
+        <thead>
+          <tr><th class="col-id">Id</th><th>Name</th><th class="col-count">Samples</th></tr>
+        </thead>
+        <tbody id="people-body"></tbody>
+      </table>
+    </div>
+    <p id="people-empty" class="hint" hidden></p>
+    <button id="merge" class="button" disabled>Merge person&hellip;</button>
+  </section>
+
+  <section class="pane pane-detail">
+
+    <div class="row row-top">
+      <div class="pane pane-samples">
+        <h2 class="pane-title">Samples</h2>
+        <div class="table-wrap table-wrap-short">
+          <table class="grid" id="samples-table">
+            <thead>
+              <tr><th class="col-id">Id</th><th>Enrolled</th><th class="col-count">Picture</th></tr>
+            </thead>
+            <tbody id="samples-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="pane pane-embedding">
+        <h2 class="pane-title">Embedding <span class="pane-note">(read only)</span></h2>
+        <div class="embedding-head">
+          <span id="embedding-summary" class="hint">no embedding</span>
+          <button id="copy-embedding" class="button button-small" disabled>Copy</button>
+          <span id="embedding-length" class="hint"></span>
+        </div>
+        <pre id="embedding" class="code"></pre>
+      </div>
+    </div>
+
+    <div class="row row-bottom">
+      <div class="pane pane-face">
+        <h2 class="pane-title">Face</h2>
+        <div class="face-frame">
+          <img id="face" alt="the picture of the selected face" hidden>
+          <span id="face-empty" class="face-empty">no picture</span>
+        </div>
+        <button id="save-photo" class="button" disabled>Save picture as&hellip;</button>
+      </div>
+
+      <div class="pane pane-properties">
+        <h2 class="pane-title">Properties</h2>
+        <div class="field">
+          <label for="name">Name:</label>
+          <input id="name" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="field field-grow">
+          <label for="metadata">Metadata:</label>
+          <textarea id="metadata" spellcheck="false" wrap="off"></textarea>
+        </div>
+        <div class="buttons">
+          <button id="save" class="button">Save changes</button>
+          <button id="format" class="button">Format JSON</button>
+          <button id="refresh" class="button">Refresh</button>
+          <button id="delete" class="button button-danger">Delete person</button>
+        </div>
+        <p class="hint">
+          The name and the metadata are stored with every sample of the person,
+          so saving changes all of them.
+        </p>
+      </div>
+    </div>
+
+  </section>
+</main>
+
+<footer class="status" id="status">Not connected.</footer>
+
+<div id="merge-overlay" class="overlay" hidden>
+  <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="merge-title">
+    <h2 id="merge-title" class="dialog-title">Merge people</h2>
+    <p id="merge-headline" class="dialog-text"></p>
+    <div class="table-wrap dialog-list">
+      <table class="grid" id="merge-table">
+        <thead>
+          <tr><th class="col-check"></th><th class="col-id">Id</th><th>Name</th><th class="col-count">Samples</th></tr>
+        </thead>
+        <tbody id="merge-body"></tbody>
+      </table>
+    </div>
+    <p id="merge-summary" class="dialog-summary"></p>
+    <div class="buttons dialog-buttons">
+      <button id="merge-confirm" class="button" disabled>Merge</button>
+      <button id="merge-cancel" class="button button-quiet">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

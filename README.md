@@ -40,6 +40,7 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
     - [PostgreSQL](#postgresql)
     - [The size of the face image (`--face-image-size`)](#the-size-of-the-face-image---face-image-size)
     - [Reviewing the enrolments](#reviewing-the-enrolments)
+      - [The same editor in a browser](#the-same-editor-in-a-browser)
     - [Locating the model files](#locating-the-model-files)
 - [CMake options](#cmake-options)
 - [Layout](#layout)
@@ -59,6 +60,9 @@ Capture (any backend) ──► Frame ──► save (PPM), record (MP4/AVI),
 - A desktop editor for the face database (`tools/face-db-editor`): review the
   enrolled people, correct their names and metadata, look at the picture of a
   face, and merge the people that are the same person.
+- A web editor for the same face database (`tools/face-db-web`): the same
+  editor in a browser, driven by a small FastAPI server that reuses the
+  storage layer of the desktop one.
 - Optional face detection and recognition (OpenCV YuNet + SFace): enrol the
   people by hand, or let the camera enrol whoever shows up -- the unknown
   faces are watched for a while first, and a person is stored with several
@@ -971,6 +975,36 @@ the command line, only by hand.
 See [`tools/face-db-editor/README.md`](tools/face-db-editor/README.md) for
 the details.
 
+##### The same editor in a browser
+
+The editor is also a web application, in
+[`tools/face-db-web`](tools/face-db-web). It shows the same people, the same
+samples, the same picture of a face, the same name and metadata and the same
+embedding, and it merges and removes the people in the same way:
+
+```sh
+pip install -r tools/face-db-web/requirements.txt
+
+python3 tools/face-db-web/web_server.py \
+    --dsn='postgres://objective_control:objective_control@127.0.0.1:5432/objective_control'
+```
+
+and then open <http://127.0.0.1:8000/> in a browser. The connection string
+is taken from `--dsn`, else from `$FACE_DB_URL`, else from `$DATABASE_URL` --
+the same order as everywhere else.
+
+The storage is **not** written a second time: the web version drives the
+very same `FaceStore` of the desktop editor, so the rules about the name of
+a person, about the metadata and about a merge are the very same rules, and
+the two editors cannot drift apart.
+
+The server has no authentication of its own and it edits the table of the
+installation, so it binds to `127.0.0.1`. Putting it on a network needs a
+reverse proxy that does the authentication.
+
+See [`tools/face-db-web/README.md`](tools/face-db-web/README.md) for the
+details.
+
 #### Locating the model files
 
 The model weights are looked up **relative to the current working directory**,
@@ -1049,6 +1083,7 @@ apps/camera_demo.cpp                          Example CLI application
 apps/mjpeg_stream.hpp                         Minimal MJPEG-over-HTTP server
 scripts/setup-db.sh                           Creates the PostgreSQL role and database
 tools/face-db-editor/                         Desktop editor for the face database
+tools/face-db-web/                            The same editor as a web application
 tests/camera_test.cpp                         Smoke test (no external test deps)
 tests/auto_enroller_test.cpp                  Tests of the tracker
 tests/auto_enroll_integration_test.cpp        Tracker and store together

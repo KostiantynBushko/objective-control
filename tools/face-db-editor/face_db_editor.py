@@ -68,6 +68,7 @@ try:
         format_embedding,
         format_metadata,
         parse_metadata,
+        sniff_image_format,
     )
 except ImportError:  # pragma: no cover - the module sits next to this file
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -82,6 +83,7 @@ except ImportError:  # pragma: no cover - the module sits next to this file
         format_embedding,
         format_metadata,
         parse_metadata,
+        sniff_image_format,
     )
 
 
@@ -122,21 +124,6 @@ MERGE_LIST_MIN_HEIGHT = 120
 #: How wide the texts of the merge window are, in pixels. The window is
 #: as wide as that, so that a line of them fits on a line.
 MERGE_TEXT_WIDTH = 620
-
-
-def sniff_image_format(data: bytes) -> str:
-    """Returns the format of an encoded image: "jpeg", "png" or "unknown".
-
-    The picture of a face is stored as the bytes of an encoded image, and
-    the C++ application writes a JPEG. The editor has to know, because
-    Tk can only show a PNG and because the extension of the file the user
-    saves should match what is in it.
-    """
-    if data.startswith(b"\xff\xd8\xff"):
-        return "jpeg"
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "png"
-    return "unknown"
 
 
 def image_to_png(data: bytes) -> bytes | None:

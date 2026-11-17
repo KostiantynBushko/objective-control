@@ -1,0 +1,7 @@
+# The web framework and the server that runs it.
+fastapi>=0.110
+uvicorn[standard]>=0.27
+
+# The PostgreSQL driver. The editor talks to the very same table the C++
+# library writes, so it needs the libpq bindings.
+psycopg[binary]>=3.1
