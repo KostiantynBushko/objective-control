@@ -1,0 +1,477 @@
+/* The face database editor in a browser.
+ *
+ * The layout follows the desktop editor: the people on the left, the
+ * detail of the selected person on the right, and the state of the
+ * editor in the bar at the top and in the bar at the bottom.
+ */
+
+:root {
+    --bg: #f4f5f7;
+    --panel: #ffffff;
+    --border: #d8dbe0;
+    --text: #1f2328;
+    --muted: #6a737d;
+    --accent: #2f6feb;
+    --accent-dark: #1f4fb0;
+    --danger: #b00020;
+    --ok: #1a7f37;
+    --off: #8a949e;
+    --radius: 6px;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    height: 100%;
+}
+
+body {
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+/* -- the bar at the top ------------------------------------------------ */
+
+.bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+}
+
+.bar-title {
+    font-weight: 600;
+    margin-right: 8px;
+    white-space: nowrap;
+}
+
+.bar-field {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+}
+
+.bar-field label {
+    color: var(--muted);
+}
+
+.bar-value {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.bar-spacer {
+    flex: 1 1 auto;
+}
+
+.pill {
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+.pill-on {
+    background: #dafbe1;
+    color: var(--ok);
+}
+
+.pill-off {
+    background: #eef0f3;
+    color: var(--off);
+}
+
+.warning {
+    padding: 8px 12px;
+    background: #fff8c5;
+    border-bottom: 1px solid #e6d98a;
+    color: #6b5200;
+}
+
+/* -- the layout -------------------------------------------------------- */
+
+.layout {
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: minmax(260px, 22%) 1fr;
+    gap: 10px;
+    padding: 10px;
+    min-height: 0;
+}
+
+.pane {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+}
+
+.pane-title {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+}
+
+.pane-note {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 400;
+}
+
+.pane-people {
+    min-height: 0;
+}
+
+.pane-detail {
+    gap: 10px;
+    overflow: auto;
+}
+
+.row {
+    display: grid;
+    gap: 10px;
+}
+
+.row-top {
+    grid-template-columns: 1fr 1fr;
+    min-height: 200px;
+}
+
+.row-bottom {
+    grid-template-columns: minmax(220px, 260px) 1fr;
+    flex: 1 1 auto;
+    min-height: 300px;
+}
+
+/* -- the tables -------------------------------------------------------- */
+
+.table-wrap {
+    flex: 1 1 auto;
+    overflow: auto;
+    min-height: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+}
+
+.table-wrap-short {
+    max-height: 190px;
+}
+
+.grid {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.grid th {
+    position: sticky;
+    top: 0;
+    background: #f7f8fa;
+    text-align: left;
+    font-weight: 600;
+    color: var(--muted);
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+}
+
+.grid td {
+    padding: 5px 8px;
+    border-bottom: 1px solid #eef0f3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.grid tbody tr:hover {
+    background: #f2f6ff;
+}
+
+.grid tbody tr.selected {
+    background: #dbeafe;
+}
+
+.col-id {
+    width: 64px;
+}
+
+.col-count {
+    width: 76px;
+    text-align: right;
+}
+
+.col-check {
+    width: 30px;
+}
+
+.grid td.col-count,
+.grid td.col-id {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* -- the inputs -------------------------------------------------------- */
+
+.filter {
+    width: 100%;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font: inherit;
+}
+
+input[type="text"], textarea {
+    width: 100%;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font: inherit;
+}
+
+textarea {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    resize: vertical;
+    min-height: 120px;
+}
+
+.field {
+    display: grid;
+    grid-template-columns: 76px 1fr;
+    align-items: start;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+
+.field label {
+    color: var(--muted);
+    padding-top: 7px;
+}
+
+.field-grow {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.field-grow textarea {
+    height: 100%;
+}
+
+.buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* -- the buttons -------------------------------------------------------- */
+
+.button {
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: #f7f8fa;
+    color: var(--text);
+    font: inherit;
+    cursor: pointer;
+}
+
+.button:hover:not(:disabled) {
+    background: #eef0f3;
+}
+
+.button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+.button-primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.button-primary:hover:not(:disabled) {
+    background: var(--accent-dark);
+}
+
+.button-danger {
+    color: var(--danger);
+    border-color: #e6c3ca;
+}
+
+.button-danger:hover:not(:disabled) {
+    background: #fdf0f2;
+}
+
+.button-quiet {
+    background: transparent;
+}
+
+.button-small {
+    padding: 2px 8px;
+    font-size: 12px;
+}
+
+/* -- the picture of a face ---------------------------------------------- */
+
+.pane-face {
+    align-items: stretch;
+}
+
+.face-frame {
+    flex: 1 1 auto;
+    min-height: 200px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fafbfc;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    padding: 6px;
+}
+
+.face-frame img {
+    max-width: 100%;
+    max-height: 320px;
+    object-fit: contain;
+}
+
+.face-empty {
+    color: var(--muted);
+}
+
+/* -- the embedding ------------------------------------------------------ */
+
+.embedding-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.code {
+    flex: 1 1 auto;
+    margin: 0;
+    padding: 8px;
+    overflow: auto;
+    min-height: 120px;
+    max-height: 260px;
+    background: #f7f8fa;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.35;
+    white-space: pre;
+}
+
+.hint {
+    color: var(--muted);
+    font-size: 12px;
+    margin: 6px 0;
+}
+
+/* -- the bar at the bottom ---------------------------------------------- */
+
+.status {
+    flex: 0 0 auto;
+    padding: 7px 12px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.status.error {
+    color: var(--danger);
+}
+
+/* -- the window of the merge -------------------------------------------- */
+
+.overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(20, 24, 30, 0.45);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    z-index: 10;
+}
+
+.dialog {
+    width: min(680px, 100%);
+    max-height: 100%;
+    display: flex;
+    flex-direction: column;
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 16px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+}
+
+.dialog-title {
+    margin: 0 0 8px;
+    font-size: 16px;
+}
+
+.dialog-text {
+    margin: 0 0 12px;
+    white-space: pre-line;
+    color: var(--text);
+}
+
+.dialog-list {
+    max-height: 320px;
+}
+
+.dialog-summary {
+    margin: 10px 0 0;
+    color: var(--muted);
+    white-space: pre-line;
+    min-height: 2.6em;
+}
+
+.dialog-buttons {
+    justify-content: flex-end;
+    margin-top: 12px;
+}
+
+/* -- the small screens -------------------------------------------------- */
+
+@media (max-width: 1000px) {
+    .layout {
+        grid-template-columns: 1fr;
+    }
+
+    .row-top {
+        grid-template-columns: 1fr;
+    }
+
+    .row-bottom {
+        grid-template-columns: 1fr;
+    }
+}

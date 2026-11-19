@@ -356,6 +356,202 @@ class StoreTest(unittest.TestCase):
         self.store.set_name(9, None)
         self.assertIsNone(self.store.list_samples(9)[0].user_name)
 
+    # -- merging -------------------------------------------------------------
+
+    def test_the_samples_of_the_source_are_moved_to_the_target(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(2, "Bob")
+
+        result = self.store.merge_people([2], 1)
+
+        self.assertEqual(result.moved, 2)
+        self.assertEqual(result.kept, 1)
+        self.assertEqual(result.target_id, 1)
+        self.assertEqual(result.sources, (2,))
+        self.assertEqual([p.person_id for p in self.store.list_people()], [1])
+        self.assertEqual(len(self.store.list_samples(1)), 3)
+
+    def test_a_moved_sample_keeps_its_row_and_its_time(self) -> None:
+        # The row keeps its identity, so that the time the face was
+        # enrolled is not lost.
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        before = self.store.list_samples(2)[0]
+
+        self.store.merge_people([2], 1)
+
+        after = [s for s in self.store.list_samples(1) if s.id == before.id]
+        self.assertEqual(len(after), 1)
+        self.assertEqual(after[0].enrolled_at, before.enrolled_at)
+
+    def test_a_moved_sample_keeps_its_picture_and_its_embedding(self) -> None:
+        # The picture and the embedding are what the face is recognised
+        # by, so a merge may not touch them.
+        self.add_sample(1, "Ada")
+        with self.store._require_connection().cursor() as cur:  # noqa: SLF001
+            cur.execute(
+                f"INSERT INTO {TEST_TABLE} (person_id, embedding, user_name, "
+                "photo) VALUES (%s, %s, %s, %s) RETURNING id",
+                (2, [0.25] * 128, "Bob", TINY_JPEG),
+            )
+            row_id = cur.fetchone()[0]
+
+        self.store.merge_people([2], 1)
+
+        moved = [s for s in self.store.list_samples(1) if s.id == row_id]
+        self.assertEqual(len(moved), 1)
+        self.assertEqual(moved[0].photo, TINY_JPEG)
+        self.assertEqual(moved[0].embedding, [0.25] * 128)
+
+    def test_the_name_of_the_target_is_kept(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+
+        result = self.store.merge_people([2], 1)
+
+        self.assertEqual(result.name, "Ada")
+        for sample in self.store.list_samples(1):
+            self.assertEqual(sample.user_name, "Ada")
+
+    def test_the_name_of_a_source_is_used_when_the_target_has_none(self) -> None:
+        # A target without a name takes the name of the person that is
+        # merged into it, like the C++ application does.
+        self.add_sample(1)
+        self.add_sample(2, "Bob")
+
+        result = self.store.merge_people([2], 1)
+
+        self.assertEqual(result.name, "Bob")
+        for sample in self.store.list_samples(1):
+            self.assertEqual(sample.user_name, "Bob")
+
+    def test_the_name_is_written_to_every_sample_of_the_merged_person(self) -> None:
+        # The name is a property of the person and is stored with every
+        # sample of it.
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(2, "Bob")
+
+        self.store.merge_people([2], 1)
+
+        names = {sample.user_name for sample in self.store.list_samples(1)}
+        self.assertEqual(names, {"Ada"})
+
+    def test_the_metadata_of_a_moved_sample_remembers_where_it_came_from(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+
+        self.store.merge_people([2], 1)
+
+        moved = [s for s in self.store.list_samples(1) if s.metadata]
+        self.assertEqual(len(moved), 1)
+        self.assertEqual(moved[0].metadata, {"merged_from_person_id": 2})
+
+    def test_the_metadata_of_a_moved_sample_keeps_what_it_had(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob", {"auto_enrolled": True, "views": 3})
+
+        self.store.merge_people([2], 1)
+
+        moved = [s for s in self.store.list_samples(1) if s.metadata]
+        self.assertEqual(
+            moved[0].metadata,
+            {"auto_enrolled": True, "views": 3, "merged_from_person_id": 2},
+        )
+
+    def test_the_metadata_of_the_samples_of_the_target_is_left_alone(self) -> None:
+        # The samples of the target did not come from anywhere.
+        self.add_sample(1, "Ada", {"role": "admin"})
+        self.add_sample(2, "Bob")
+        before = self.store.list_samples(1)[0]
+
+        self.store.merge_people([2], 1)
+
+        kept = [s for s in self.store.list_samples(1) if s.id == before.id]
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].metadata, {"role": "admin"})
+
+    def test_a_sample_that_was_moved_before_keeps_the_id_it_came_from(self) -> None:
+        # A sample that was merged already says where it came from, and
+        # that is more useful than the person it was merged into.
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(3, "Bob")
+
+        self.store.merge_people([2], 1)
+        self.store.merge_people([3], 1)
+
+        moved = [s for s in self.store.list_samples(1) if s.metadata]
+        origins = sorted(s.metadata["merged_from_person_id"] for s in moved)
+        self.assertEqual(origins, [2, 3])
+
+    def test_several_people_can_be_merged_at_once(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(3, "Bob")
+
+        result = self.store.merge_people([2, 3], 1)
+
+        self.assertEqual(result.moved, 2)
+        self.assertEqual(result.sources, (2, 3))
+        self.assertEqual([p.person_id for p in self.store.list_people()], [1])
+
+    def test_the_people_that_are_not_merged_are_left_alone(self) -> None:
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(3, "Grace")
+
+        self.store.merge_people([2], 1)
+
+        people = {p.person_id: p.user_name for p in self.store.list_people()}
+        self.assertEqual(people, {1: "Ada", 3: "Grace"})
+
+    def test_the_name_of_the_merged_person_can_be_resolved_before_the_merge(
+        self,
+    ) -> None:
+        # The editor shows what the merge is going to do before it is
+        # done, and that needs the name beforehand.
+        self.add_sample(1, "Ada")
+        self.add_sample(2, "Bob")
+        self.add_sample(3)
+
+        self.assertEqual(self.store.resolve_merge_name([2], 1), "Ada")
+        self.assertEqual(self.store.resolve_merge_name([2], 3), "Bob")
+        # Nobody has a name, so the merged person has none either.
+        self.assertIsNone(self.store.resolve_merge_name([3], 4))
+
+    def test_a_person_cannot_be_merged_into_itself(self) -> None:
+        self.add_sample(1, "Ada")
+
+        with self.assertRaises(FaceDbError):
+            self.store.merge_people([1], 1)
+
+    def test_a_merge_without_a_source_is_refused(self) -> None:
+        self.add_sample(1, "Ada")
+
+        with self.assertRaises(FaceDbError):
+            self.store.merge_people([], 1)
+
+    def test_a_merge_of_a_person_that_is_not_there_is_refused(self) -> None:
+        self.add_sample(1, "Ada")
+
+        with self.assertRaises(FaceDbError):
+            self.store.merge_people([99], 1)
+
+        # Nothing was changed by the refused merge.
+        self.assertEqual([p.person_id for p in self.store.list_people()], [1])
+        self.assertEqual(len(self.store.list_samples(1)), 1)
+
+    def test_a_merge_into_a_person_that_is_not_there_is_refused(self) -> None:
+        self.add_sample(2, "Bob")
+
+        with self.assertRaises(FaceDbError):
+            self.store.merge_people([2], 99)
+
+        # The samples of the source are still where they were.
+        self.assertEqual([p.person_id for p in self.store.list_people()], [2])
+
     # -- a table without the properties --------------------------------------
 
     def test_a_table_without_the_properties_is_used_as_it_is(self) -> None:

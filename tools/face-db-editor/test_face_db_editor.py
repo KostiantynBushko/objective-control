@@ -186,6 +186,65 @@ class EditorWindowTest(unittest.TestCase):
         self.assertTrue(self.editor.store.connected)
         self.assertEqual(self.editor.connect_button.cget("text"), "Disconnect")
 
+    # -- merging people ------------------------------------------------------
+
+    def test_the_merge_button_is_disabled_when_disconnected(self) -> None:
+        self.editor.disconnect()
+        self.assertEqual(str(self.editor.merge_button.cget("state")), "disabled")
+
+        self.editor.connect()
+        self.assertEqual(str(self.editor.merge_button.cget("state")), "normal")
+
+    def test_merging_moves_the_samples_of_the_people_that_are_picked(self) -> None:
+        self.add_sample(1, "Ada Lovelace")
+        self.add_sample(2, "Bob")
+        self.editor.refresh()
+
+        self.editor.apply_merge(1, [2])
+
+        people = self.editor.store.list_people()
+        self.assertEqual([p.person_id for p in people], [1])
+        self.assertEqual(people[0].samples, 2)
+
+    def test_the_merged_person_keeps_the_name_of_the_target(self) -> None:
+        self.add_sample(1, "Ada Lovelace")
+        self.add_sample(2, "Bob")
+        self.editor.refresh()
+
+        self.editor.apply_merge(1, [2])
+
+        for sample in self.editor.store.list_samples(1):
+            self.assertEqual(sample.user_name, "Ada Lovelace")
+
+    def test_the_status_says_what_the_merge_did(self) -> None:
+        self.add_sample(1, "Ada Lovelace")
+        self.add_sample(2, "Bob")
+        self.editor.refresh()
+
+        self.editor.apply_merge(1, [2])
+
+        self.assertIn("Moved 1 sample(s)", self.editor.status_var.get())
+
+        # The message survives the events that the refresh queued.
+        self.root.update()
+        self.assertIn("Moved 1 sample(s)", self.editor.status_var.get())
+
+    def test_a_merge_that_fails_is_reported(self) -> None:
+        # The person is not in the table, so the merge is refused and
+        # the editor stays usable.
+        self.add_sample(1, "Ada Lovelace")
+        self.editor.refresh()
+
+        self.editor.apply_merge(99, [1])
+
+        self.assertIn("Could not merge", self.editor.status_var.get())
+        self.assertTrue(self.editor.store.connected)
+
+    def test_merging_without_a_person_is_refused(self) -> None:
+        self.editor.people_tree.selection_remove(self.editor.people_tree.selection())
+        self.editor.apply_merge(1, [2])
+        self.assertNotIn("Moved", self.editor.status_var.get())
+
     # -- the embedding of a sample -------------------------------------------
 
     def test_the_embedding_of_the_sample_is_shown(self) -> None:
@@ -263,6 +322,98 @@ class EditorWindowTest(unittest.TestCase):
         )
 
 
+class MergeDialogTest(unittest.TestCase):
+    """The window that asks which people are merged into the selected one."""
+
+    def setUp(self) -> None:
+        if not has_display():
+            self.skipTest("no display available")
+
+        # The root is not withdrawn: the window of the dialog is only
+        # shown when the window it belongs to is.
+        self.root = tk.Tk()
+        self.addCleanup(self.root.destroy)
+
+        self.store = StubStore("postgres://user@localhost/faces", TEST_TABLE)
+        self.target = face_db_editor.Person(1, 3, "Ada Lovelace")
+        self.others = [
+            face_db_editor.Person(2, 1, None),
+            face_db_editor.Person(3, 2, "Bob"),
+        ]
+        self.dialog = face_db_editor.MergeDialog(
+            self.root, self.store, self.target, self.others
+        )
+        self.addCleanup(self.dialog.window.destroy)
+        self.root.update()
+
+    def test_the_dialog_lists_the_people_that_can_be_merged_in(self) -> None:
+        # The person that is merged into is not in the list: it cannot
+        # be merged into itself.
+        self.assertEqual(sorted(self.dialog.tree.get_children()), ["2", "3"])
+
+    def test_the_merge_button_is_off_until_a_person_is_picked(self) -> None:
+        self.assertEqual(str(self.dialog.merge_button.cget("state")), "disabled")
+
+        self.dialog.tree.selection_set("2")
+        self.dialog._update_summary()  # noqa: SLF001
+
+        self.assertEqual(str(self.dialog.merge_button.cget("state")), "normal")
+
+    def test_the_summary_says_what_the_merge_is_going_to_do(self) -> None:
+        self.dialog.tree.selection_set("2", "3")
+        self.dialog._update_summary()  # noqa: SLF001
+
+        summary = self.dialog.summary_var.get()
+        self.assertIn("3 sample(s) of 2 people", summary)
+        self.assertIn("moved into person 1", summary)
+
+    def test_the_summary_says_the_name_the_merged_person_will_have(self) -> None:
+        self.dialog.tree.selection_set("2")
+        self.dialog._update_summary()  # noqa: SLF001
+
+        self.assertIn("Ada Lovelace", self.dialog.summary_var.get())
+
+    def test_the_dialog_gives_the_ids_of_the_people_that_were_picked(self) -> None:
+        self.dialog.tree.selection_set("2", "3")
+        self.dialog._update_summary()  # noqa: SLF001
+
+        self.dialog.merge()
+
+        self.assertEqual(self.dialog.result, (2, 3))
+
+    def test_cancelling_the_dialog_gives_nothing(self) -> None:
+        self.dialog.tree.selection_set("2")
+        self.dialog._update_summary()  # noqa: SLF001
+
+        self.dialog.cancel()
+
+        self.assertIsNone(self.dialog.result)
+
+    def test_merging_without_a_pick_does_nothing(self) -> None:
+        self.dialog.merge()
+
+        self.assertIsNone(self.dialog.result)
+
+    # -- the window is not squeezed ------------------------------------------
+
+    def test_the_list_of_the_people_keeps_its_room(self) -> None:
+        # The summary grows when a person is picked, and the list of the
+        # people may not collapse because of it: a list that is not
+        # shown is a list that cannot be used.
+        self.dialog.tree.selection_set("2", "3")
+        self.dialog._update_summary()  # noqa: SLF001
+        self.root.update()
+
+        self.assertTrue(self.dialog.tree.winfo_ismapped())
+        self.assertGreater(self.dialog.tree.winfo_height(), 0)
+
+    def test_the_buttons_of_the_window_are_seen(self) -> None:
+        buttons = self.dialog.window.winfo_children()[0].winfo_children()[3]
+        for button in buttons.winfo_children():
+            self.assertTrue(button.winfo_ismapped(), "a button is not shown")
+            self.assertGreater(button.winfo_height(), 0)
+
+
 class StubStore:
     """A store that keeps nothing and reaches no database.
 
@@ -294,6 +445,9 @@ class StubStore:
 
     def list_samples(self, person_id: int) -> list:
         return []
+
+    def resolve_merge_name(self, source_ids, target_id: int) -> str | None:
+        return "Ada Lovelace"
 
 
 class LayoutTest(unittest.TestCase):
@@ -393,6 +547,13 @@ class LayoutTest(unittest.TestCase):
         # small for everything else: it would leave the pane empty.
         self.assertTrue(self.editor.embedding_text.winfo_ismapped())
         self.assertGreater(self.editor.embedding_text.winfo_height(), 0)
+
+    def test_the_merge_button_is_seen(self) -> None:
+        # The merge button belongs to the list of the people, and it has
+        # to be seen: a button that is not shown cannot be used.
+        self.assertTrue(self.editor.merge_button.winfo_ismapped())
+        self.assertGreater(self.editor.merge_button.winfo_height(), 0)
+        self.assertGreater(self.editor.merge_button.winfo_width(), 0)
 
     def test_the_copy_button_of_the_embedding_is_seen(self) -> None:
         self.assertTrue(self.editor.copy_embedding_button.winfo_ismapped())
